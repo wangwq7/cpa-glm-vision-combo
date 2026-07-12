@@ -10,7 +10,7 @@ import (
 func testRuntime() runtimeConfig {
 	cfg := defaultPluginConfig()
 	normalized, _ := normalizeConfig(cfg)
-	return runtimeConfig{pluginConfig: normalized, cache: newMemoCache(8)}
+	return runtimeConfig{pluginConfig: normalized, cache: newMemoCache(8, ""), events: newEventStore(100)}
 }
 
 func TestTransformOpenAIRequestReplacesImageAndPreservesText(t *testing.T) {
@@ -35,7 +35,7 @@ func TestTransformOpenAIRequestReplacesImageAndPreservesText(t *testing.T) {
 func TestTransformRespectsRemoteURLPolicy(t *testing.T) {
 	r := testRuntime()
 	r.AllowRemoteImageURLs = false
-	_, _, err := transformOpenAIRequest([]byte(`{"messages":[{"content":[{"type":"image_url","image_url":{"url":"https://example.test/a.png"}}]}]}`), r, func(visualAsset, string) (string, error) { return "", nil })
+	_, _, err := transformOpenAIRequest([]byte(`{"messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"https://example.test/a.png"}}]}]}`), r, func(asset visualAsset, _ string) (string, error) { return "", validateAsset(asset.URL, r) })
 	if err == nil {
 		t.Fatal("expected URL policy error")
 	}
@@ -47,7 +47,7 @@ func TestVisionRequestAndResponse(t *testing.T) {
 	if err := json.Unmarshal(request, &decoded); err != nil {
 		t.Fatal(err)
 	}
-	if decoded["model"] != "vision" {
+	if decoded["model"] != "vision(low)" || decoded["reasoning_effort"] != "low" {
 		t.Fatal(decoded)
 	}
 	if got := extractVisionText([]byte(`{"choices":[{"message":{"content":"diagram: one box"}}]}`)); got != "diagram: one box" {
@@ -69,33 +69,24 @@ func TestTooManyNewImagesAreRejectedBeforeAnyVisionCall(t *testing.T) {
 	}
 }
 
-func TestCachedHistoryImagesDoNotConsumeNewImageLimit(t *testing.T) {
+func TestCachedHistoricalImageIsCompactedWithoutVisionCall(t *testing.T) {
 	r := testRuntime()
 	r.MaxImagesPerRequest = 1
-	assets := []visualAsset{
-		{URL: "https://example.test/already-seen.png"},
-		{URL: "https://example.test/new.png"},
-	}
-	r.cache.set(visualCacheKey(r, assets[0]), "cached visual memory", time.Hour)
-	if err := enforceVisualImageLimit(r, assets); err != nil {
-		t.Fatalf("cached history plus one new image should be allowed: %v", err)
-	}
-	assets = append(assets, visualAsset{URL: "https://example.test/another-new.png"})
-	if err := enforceVisualImageLimit(r, assets); err == nil {
-		t.Fatal("two new images should exceed a limit of one")
+	raw := []byte(`{"messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"data:image/png;base64,YQ=="}}]},{"role":"assistant","content":"看到了"},{"role":"user","content":"继续讨论代码"}]}`)
+	var root any
+	_ = json.Unmarshal(raw, &root)
+	asset := collectVisualAssets(root)[0]
+	r.cache.set(visualCacheKey(r, asset), "vision", "cached visual memory with details", time.Hour)
+	calls := 0
+	got, _, err := transformOpenAIRequest(raw, r, func(visualAsset, string) (string, error) { calls++; return "", nil })
+	if err != nil || calls != 0 || !strings.Contains(string(got), "历史图片附件已归档") || strings.Contains(string(got), "data:image") {
+		t.Fatalf("calls=%d err=%v body=%s", calls, err, got)
 	}
 }
 
 func TestAllCachedHistoryImagesAreRewritten(t *testing.T) {
 	r := testRuntime()
-	r.MaxImagesPerRequest = 1
-	assets := []visualAsset{
-		{URL: "https://example.test/one.png"},
-		{URL: "https://example.test/two.png"},
-	}
-	for _, asset := range assets {
-		r.cache.set(visualCacheKey(r, asset), "cached", time.Hour)
-	}
+	r.MaxImagesPerRequest = 2
 	raw := []byte(`{"messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"https://example.test/one.png"}},{"type":"image_url","image_url":{"url":"https://example.test/two.png"}}]}]}`)
 	got, count, err := transformOpenAIRequest(raw, r, func(visualAsset, string) (string, error) { return "cached visual memory", nil })
 	if err != nil || count != 2 {

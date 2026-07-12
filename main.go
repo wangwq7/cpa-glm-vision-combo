@@ -38,7 +38,7 @@ import (
 
 const pluginID = "glm-vision-combo"
 
-var pluginVersion = "0.2.6"
+var pluginVersion = "0.3.0"
 var configured atomic.Value
 var telemetry = newEventStore(100)
 
@@ -137,7 +137,11 @@ func cliproxyPluginFree(ptr unsafe.Pointer, _ C.size_t) {
 }
 
 //export cliproxyPluginShutdown
-func cliproxyPluginShutdown() {}
+func cliproxyPluginShutdown() {
+	if raw := configured.Load(); raw != nil {
+		raw.(runtimeConfig).cache.close()
+	}
+}
 
 func handleMethod(method string, payload []byte) ([]byte, error) {
 	switch method {
@@ -147,7 +151,7 @@ func handleMethod(method string, payload []byte) ([]byte, error) {
 		}
 		return okEnvelope(pluginRegistration())
 	case pluginabi.MethodModelStatic, pluginabi.MethodModelForAuth:
-		return okEnvelope(pluginapi.ModelResponse{Provider: pluginID, Models: []pluginapi.ModelInfo{comboModel(currentConfig())}})
+		return okEnvelope(pluginapi.ModelResponse{Provider: pluginID, Models: comboModels(currentConfig())})
 	case pluginabi.MethodModelRoute:
 		return routeModel(payload)
 	case pluginabi.MethodExecutorIdentifier:
@@ -185,7 +189,20 @@ func configure(raw []byte) error {
 		return err
 	}
 	telemetry.setLimit(normalized.EventLogMaxEntries)
-	configured.Store(runtimeConfig{pluginConfig: normalized, cache: newMemoCache(normalized.CacheMaxEntries), events: telemetry})
+	var cache *memoCache
+	if previous := configured.Load(); previous != nil {
+		old := previous.(runtimeConfig).cache
+		if old.compatible(normalized.CachePath) {
+			cache = old
+			cache.setLimit(normalized.CacheMaxEntries)
+		} else {
+			old.close()
+		}
+	}
+	if cache == nil {
+		cache = newMemoCache(normalized.CacheMaxEntries, normalized.CachePath)
+	}
+	configured.Store(runtimeConfig{pluginConfig: normalized, cache: cache, events: telemetry})
 	return nil
 }
 func currentConfig() runtimeConfig {
@@ -193,37 +210,57 @@ func currentConfig() runtimeConfig {
 		return raw.(runtimeConfig)
 	}
 	cfg, _ := normalizeConfig(defaultPluginConfig())
-	r := runtimeConfig{pluginConfig: cfg, cache: newMemoCache(cfg.CacheMaxEntries), events: telemetry}
+	r := runtimeConfig{pluginConfig: cfg, cache: newMemoCache(cfg.CacheMaxEntries, cfg.CachePath), events: telemetry}
 	configured.Store(r)
 	return r
 }
 func metadata() pluginapi.Metadata {
-	return pluginapi.Metadata{Name: "GLM Vision Combo", Version: pluginVersion, Author: "Local plugin", GitHubRepository: "https://github.com/router-for-me/CLIProxyAPI", ConfigFields: []pluginapi.ConfigField{
-		{Name: "combo_model", Type: pluginapi.ConfigFieldTypeString, Description: "对外暴露的虚拟模型名。Agent 只调用这个名字。"},
-		{Name: "primary_model", Type: pluginapi.ConfigFieldTypeString, Description: "最终回答始终使用的文本模型；推荐 glm-5.2。"},
-		{Name: "vision_primary_model", Type: pluginapi.ConfigFieldTypeString, Description: "首选视觉模型。检测到图片时先调用它，成功后仍由主文本模型完成最终回答。"},
-		{Name: "vision_backup_model_1", Type: pluginapi.ConfigFieldTypeString, Description: "备用视觉模型 1。首选模型超时、报错或不可用时自动尝试。"},
+	return pluginapi.Metadata{Name: "GLM Vision Bridge", Version: pluginVersion, Author: "wangwq7", GitHubRepository: "https://github.com/wangwq7/cpa-glm-vision-combo", ConfigFields: []pluginapi.ConfigField{
+		{Name: "combo_model", Type: pluginapi.ConfigFieldTypeString, Description: "对外暴露的主要虚拟模型名。"},
+		{Name: "combo_aliases", Type: pluginapi.ConfigFieldTypeArray, Description: "同一功能的额外对外模型名。"},
+		{Name: "primary_model", Type: pluginapi.ConfigFieldTypeString, Description: "最终回答始终优先使用的文本模型。"},
+		{Name: "primary_context_tokens", Type: pluginapi.ConfigFieldTypeInteger, Description: "主文本模型理论上下文上限。"},
+		{Name: "primary_context_budget_tokens", Type: pluginapi.ConfigFieldTypeInteger, Description: "主模型实际工作预算，必须低于理论上限。"},
+		{Name: "text_fallback_models", Type: pluginapi.ConfigFieldTypeArray, Description: "主文本模型失败且尚未输出内容时依次尝试的备用模型。"},
+		{Name: "vision_primary_model", Type: pluginapi.ConfigFieldTypeString, Description: "首选视觉模型；只负责识别，不负责最终回答。"},
+		{Name: "vision_backup_model_1", Type: pluginapi.ConfigFieldTypeString, Description: "备用视觉模型 1。"},
 		{Name: "vision_backup_model_2", Type: pluginapi.ConfigFieldTypeString, Description: "备用视觉模型 2。"},
 		{Name: "vision_backup_model_3", Type: pluginapi.ConfigFieldTypeString, Description: "备用视觉模型 3。"},
-		{Name: "vision_context_limit", Type: pluginapi.ConfigFieldTypeInteger, Description: "上述视觉模型共同的最大上下文。默认 256K；插件会在调用前拦截超限请求。"},
-		{Name: "vision_models", Type: pluginapi.ConfigFieldTypeArray, Description: "高级模式：按优先级定义 {model, context_limit, enabled}。填写首选/备用字段时，它们优先。"},
-		{Name: "vision_input_token_budget", Type: pluginapi.ConfigFieldTypeInteger, Description: "单次视觉识别可带入的文本预算；不会把完整长会话发送给视觉模型。"},
-		{Name: "vision_output_tokens", Type: pluginapi.ConfigFieldTypeInteger, Description: "每次视觉识别的最大输出 token。"},
-		{Name: "vision_timeout_seconds", Type: pluginapi.ConfigFieldTypeInteger, Description: "每个视觉候选模型的超时时间。"},
-		{Name: "cache_ttl_seconds", Type: pluginapi.ConfigFieldTypeInteger, Description: "同一图片视觉记忆的内存缓存时间；更新或重启后自动清空。"},
-		{Name: "cache_max_entries", Type: pluginapi.ConfigFieldTypeInteger, Description: "视觉记忆内存缓存的最大条数，达到上限后淘汰较早条目。"},
-		{Name: "event_log_max_entries", Type: pluginapi.ConfigFieldTypeInteger, Description: "组合请求事件日志保留条数。日志只保留处理阶段和视觉记忆摘要，不保存原始图片链接。"},
-		{Name: "on_vision_failure", Type: pluginapi.ConfigFieldTypeEnum, EnumValues: []string{"error", "text_only"}, Description: "所有视觉模型失败时，返回错误或仅继续文本内容。"},
-		{Name: "max_images_per_request", Type: pluginapi.ConfigFieldTypeInteger, Description: "单次请求中允许调用视觉模型的最多未缓存新图片数。历史缓存图片会全部替换为视觉记忆；超过上限将拒绝整次请求，绝不向主文本模型透传原图。"},
-		{Name: "max_image_data_bytes", Type: pluginapi.ConfigFieldTypeInteger, Description: "data URL 内嵌图片的最大字节数，防止异常大图片占用内存。"},
-		{Name: "allow_remote_image_urls", Type: pluginapi.ConfigFieldTypeBoolean, Description: "是否允许视觉模型读取 http/https 图片 URL。"},
+		{Name: "vision_context_limit", Type: pluginapi.ConfigFieldTypeInteger, Description: "兼容模式下视觉候选共享的上下文上限。"},
+		{Name: "vision_models", Type: pluginapi.ConfigFieldTypeArray, Description: "高级视觉链：model、context_limit、context_budget、timeout_seconds、max_output_tokens、enabled。"},
+		{Name: "vision_input_token_budget", Type: pluginapi.ConfigFieldTypeInteger, Description: "视觉请求仅携带当前问题附近文字的最大预算。"},
+		{Name: "vision_output_tokens", Type: pluginapi.ConfigFieldTypeInteger, Description: "视觉识别输出上限。"},
+		{Name: "vision_timeout_seconds", Type: pluginapi.ConfigFieldTypeInteger, Description: "单个视觉候选超时时间。"},
+		{Name: "cache_ttl_seconds", Type: pluginapi.ConfigFieldTypeInteger, Description: "视觉记忆和历史摘要的持久缓存时长。"},
+		{Name: "cache_max_entries", Type: pluginapi.ConfigFieldTypeInteger, Description: "持久缓存最大条数，使用 LRU 淘汰。"},
+		{Name: "cache_path", Type: pluginapi.ConfigFieldTypeString, Description: "缓存文件路径。"},
+		{Name: "event_log_max_entries", Type: pluginapi.ConfigFieldTypeInteger, Description: "内存事件日志保留条数，不保存原图。"},
+		{Name: "on_vision_failure", Type: pluginapi.ConfigFieldTypeEnum, EnumValues: []string{"error", "text_only"}, Description: "所有视觉模型失败时的兼容策略。"},
+		{Name: "strict_vision_failure", Type: pluginapi.ConfigFieldTypeBoolean, Description: "所有视觉候选失败时直接报错。"},
+		{Name: "max_images_per_request", Type: pluginapi.ConfigFieldTypeInteger, Description: "当前轮允许完整识别的最大图片数。"},
+		{Name: "max_concurrent_extractions", Type: pluginapi.ConfigFieldTypeInteger, Description: "多张图片的并发识别数。"},
+		{Name: "max_image_data_bytes", Type: pluginapi.ConfigFieldTypeInteger, Description: "data URL 图片解码后的真实最大字节数。"},
+		{Name: "allow_remote_image_urls", Type: pluginapi.ConfigFieldTypeBoolean, Description: "是否允许读取 http/https 图片 URL。"},
+		{Name: "history_attachment_mode", Type: pluginapi.ConfigFieldTypeEnum, EnumValues: []string{"onDemand", "retain"}, Description: "历史图片按需恢复或完整保留。"},
+		{Name: "history_attachment_compact_chars", Type: pluginapi.ConfigFieldTypeInteger, Description: "无关轮中的历史图片短摘要字符数。"},
+		{Name: "history_attachment_restore_max_attachments", Type: pluginapi.ConfigFieldTypeInteger, Description: "明确引用图片时最多恢复的历史图片数。"},
+		{Name: "auto_compression_enabled", Type: pluginapi.ConfigFieldTypeBoolean, Description: "达到阈值后自动压缩较早对话。"},
+		{Name: "auto_compression_threshold_tokens", Type: pluginapi.ConfigFieldTypeInteger, Description: "自动压缩触发阈值。"},
+		{Name: "auto_compression_target_tokens", Type: pluginapi.ConfigFieldTypeInteger, Description: "历史摘要目标 token。"},
+		{Name: "auto_compression_keep_recent_turns", Type: pluginapi.ConfigFieldTypeInteger, Description: "压缩时保留原文的最近轮数。"},
+		{Name: "auto_compression_model", Type: pluginapi.ConfigFieldTypeString, Description: "压缩模型；留空使用首选文本模型。"},
 	}}
 }
 func pluginRegistration() registration {
 	return registration{SchemaVersion: pluginabi.SchemaVersion, Metadata: metadata(), Capabilities: capabilities{ModelProvider: true, ModelRouter: true, Executor: true, ExecutorModelScope: string(pluginapi.ExecutorModelScopeStatic), ExecutorInputFormats: []string{"openai"}, ExecutorOutputFormats: []string{"openai"}, ManagementAPI: true}}
 }
-func comboModel(cfg runtimeConfig) pluginapi.ModelInfo {
-	return pluginapi.ModelInfo{ID: cfg.ComboModel, Object: "model", OwnedBy: pluginID, Type: "chat", DisplayName: "GLM-5.2 Vision Combo", Description: "Visual preprocessing with GLM as the final text model.", ContextLength: 1000000, MaxCompletionTokens: 16384, SupportedGenerationMethods: []string{"chat"}, SupportedInputModalities: []string{"text", "image"}, SupportedOutputModalities: []string{"text"}, UserDefined: true}
+func comboModels(cfg runtimeConfig) []pluginapi.ModelInfo {
+	names := append([]string{cfg.ComboModel}, cfg.ComboAliases...)
+	models := make([]pluginapi.ModelInfo, 0, len(names))
+	for _, name := range names {
+		models = append(models, pluginapi.ModelInfo{ID: name, Object: "model", OwnedBy: pluginID, Type: "chat", DisplayName: "GLM Vision Bridge", Description: "视觉模型只负责转写；最终任务始终由首选文本模型及其文本备用链完成。", ContextLength: int64(cfg.PrimaryContextTokens), MaxCompletionTokens: 16384, SupportedGenerationMethods: []string{"chat"}, SupportedInputModalities: []string{"text", "image"}, SupportedOutputModalities: []string{"text"}, UserDefined: true})
+	}
+	return models
 }
 
 func routeModel(raw []byte) ([]byte, error) {
@@ -232,7 +269,12 @@ func routeModel(raw []byte) ([]byte, error) {
 		return nil, err
 	}
 	cfg := currentConfig()
-	if !cfg.Enabled || req.SourceFormat != "openai" || strings.TrimSpace(req.RequestedModel) != cfg.ComboModel {
+	requested := strings.TrimSpace(req.RequestedModel)
+	matched := requested == cfg.ComboModel
+	for _, alias := range cfg.ComboAliases {
+		matched = matched || requested == alias
+	}
+	if !cfg.Enabled || req.SourceFormat != "openai" || !matched {
 		return okEnvelope(pluginapi.ModelRouteResponse{Handled: false})
 	}
 	return okEnvelope(pluginapi.ModelRouteResponse{Handled: true, TargetKind: pluginapi.ModelRouteTargetSelf, Reason: "glm_vision_combo_orchestration"})
@@ -256,15 +298,21 @@ func execute(raw []byte) ([]byte, error) {
 		cfg.events.finish(event, err)
 		return nil, err
 	}
-	primaryStarted := time.Now()
-	cfg.events.stage(event, "交给主文本模型", "完成", cfg.PrimaryModel, "图片已替换为结构化视觉记忆，已提交给主文本模型；主模型不再接收原始图片。", primaryStarted)
-	response, err := hostExecute(req.HostCallbackID, cfg.PrimaryModel, body, false)
+	body, err = prepareFinalTextBody(body, cfg, req.HostCallbackID, event)
 	if err != nil {
-		cfg.events.stage(event, "主文本模型返回", "失败", cfg.PrimaryModel, err.Error(), primaryStarted)
+		cfg.events.stage(event, "主上下文预算", "失败", cfg.PrimaryModel, err.Error(), time.Now())
 		cfg.events.finish(event, err)
 		return nil, err
 	}
-	cfg.events.stage(event, "主文本模型返回", "完成", cfg.PrimaryModel, "已生成最终非流式回答。", primaryStarted)
+	primaryStarted := time.Now()
+	cfg.events.stage(event, "交给文本模型链", "完成", cfg.PrimaryModel, "请求已完成附件处理与上下文预算检查；图片不会进入文本模型。", primaryStarted)
+	response, usedModel, err := executeTextFallback(req.HostCallbackID, cfg, body, event)
+	if err != nil {
+		cfg.events.stage(event, "文本模型链返回", "失败", usedModel, err.Error(), primaryStarted)
+		cfg.events.finish(event, err)
+		return nil, err
+	}
+	cfg.events.stage(event, "文本模型链返回", "完成", usedModel, "已生成最终非流式回答。", primaryStarted)
 	cfg.events.finish(event, nil)
 	return okEnvelope(pluginapi.ExecutorResponse{Payload: response.Body, Headers: response.Headers})
 }
@@ -287,13 +335,17 @@ func executeStream(raw []byte) ([]byte, error) {
 			cfg.events.stage(event, "纯文本直达", "完成", cfg.PrimaryModel, "未检测到图片，跳过视觉候选链。", time.Now())
 		}
 		if err == nil {
+			body, err = prepareFinalTextBody(body, cfg, req.HostCallbackID, event)
+		}
+		if err == nil {
 			primaryStarted := time.Now()
-			cfg.events.stage(event, "交给主文本模型", "完成", cfg.PrimaryModel, "图片已替换为结构化视觉记忆，已提交主模型并开始透传输出流。", primaryStarted)
-			err = forwardPrimaryStream(req.StreamID, req.HostCallbackID, cfg.PrimaryModel, body)
+			cfg.events.stage(event, "交给文本模型链", "完成", cfg.PrimaryModel, "请求已完成附件处理与上下文预算检查，开始透传输出流。", primaryStarted)
+			var usedModel string
+			usedModel, err = forwardTextFallbackStream(req.StreamID, req.HostCallbackID, cfg, body, event)
 			if err != nil {
-				cfg.events.stage(event, "主文本流结束", "失败", cfg.PrimaryModel, err.Error(), primaryStarted)
+				cfg.events.stage(event, "文本流结束", "失败", usedModel, err.Error(), primaryStarted)
 			} else {
-				cfg.events.stage(event, "主文本流结束", "完成", cfg.PrimaryModel, "流式输出已完整透传。", primaryStarted)
+				cfg.events.stage(event, "文本流结束", "完成", usedModel, "流式输出已完整透传。", primaryStarted)
 			}
 		} else {
 			cfg.events.stage(event, "多模态预处理", "失败", "", err.Error(), time.Now())
@@ -313,46 +365,84 @@ func preparePrimaryBody(raw []byte, cfg runtimeConfig, callbackID string, event 
 	})
 }
 func describeImage(cfg runtimeConfig, callbackID string, asset visualAsset, contextText string, event *comboEvent) (string, error) {
-	key := visualCacheKey(cfg, asset)
-	if cached, ok := cfg.cache.get(key); ok {
-		cfg.events.stage(event, "读取视觉记忆缓存", "完成", "缓存", "同一图片命中本地内存缓存，未再次调用视觉模型。", time.Now())
-		return cached, nil
+	if err := validateAsset(asset.URL, cfg); err != nil {
+		return "", err
 	}
-	cfg.events.stage(event, "进入视觉候选链", "完成", "", fmt.Sprintf("视觉文本窗口预算 %d token；原图不会发送给主文本模型。", cfg.VisionInputTokenBudget), time.Now())
+	key := visualCacheKey(cfg, asset)
+	if key != "" {
+		if cached, ok := cfg.cache.get(key); ok {
+			cfg.events.stage(event, "读取视觉记忆缓存", "完成", "缓存", "同一图片命中本地内存缓存，未再次调用视觉模型。", time.Now())
+			return cached, nil
+		}
+	}
+	value, joined, err := cfg.cache.do(key, func() (string, error) {
+		cfg.events.stage(event, "进入视觉候选链", "完成", "", fmt.Sprintf("仅携带当前用户附近文字（最多 %d token）；识别请求强制 low 思考。", cfg.VisionInputTokenBudget), time.Now())
+		var lastErr error
+		for _, candidate := range cfg.VisionModels {
+			if !candidate.active() {
+				cfg.events.stage(event, "视觉候选跳过", "跳过", candidate.Model, "该候选模型已在配置中停用。", time.Now())
+				continue
+			}
+			projectedInput := estimateTokens(contextText) + cfg.VisionImageTokenReserve
+			if projectedInput > candidate.ContextBudget || projectedInput+candidate.MaxOutputTokens > candidate.ContextLimit {
+				lastErr = fmt.Errorf("vision model %s skipped: projected context exceeds %d", candidate.Model, candidate.ContextLimit)
+				cfg.events.stage(event, "视觉上下文预检", "跳过", candidate.Model, fmt.Sprintf("预测输入 %d token，超过工作预算 %d 或总上限 %d，未发送请求。", projectedInput, candidate.ContextBudget, candidate.ContextLimit), time.Now())
+				continue
+			}
+			candidateStarted := time.Now()
+			request := makeVisionRequest(candidate.Model, cfg.VisionPrompt, contextText, asset.URL, candidate.MaxOutputTokens)
+			result, err := hostExecuteWithTimeout(callbackID, lowThinkingModel(candidate.Model), request, candidate.TimeoutSeconds)
+			if err != nil {
+				lastErr = err
+				cfg.events.stage(event, "视觉候选调用", "失败", candidate.Model, "调用失败，继续尝试下一个候选："+err.Error(), candidateStarted)
+				continue
+			}
+			description := extractVisionText(result.Body)
+			if description == "" {
+				lastErr = fmt.Errorf("vision model %s returned no usable text", candidate.Model)
+				cfg.events.stage(event, "视觉候选调用", "失败", candidate.Model, "返回为空，继续尝试下一个候选。", candidateStarted)
+				continue
+			}
+			cfg.cache.set(key, "vision", description, cacheTTL(cfg))
+			cfg.events.stage(event, "视觉识别完成", "完成", candidate.Model, "已提取视觉记忆：\n"+description, candidateStarted)
+			cfg.events.stage(event, "注入视觉记忆", "完成", cfg.PrimaryModel, "原始图片片段已替换为上方视觉记忆文本，随后继续由主文本模型完成任务。", time.Now())
+			return description, nil
+		}
+		if lastErr == nil {
+			lastErr = fmt.Errorf("no enabled visual model is configured")
+		}
+		return "", lastErr
+	})
+	if joined && err == nil {
+		cfg.events.stage(event, "合并重复识图请求", "完成", "缓存", "相同图片正在识别，本请求复用了同一任务。", time.Now())
+	}
+	return value, err
+}
+
+func textModels(cfg runtimeConfig) []string {
+	return uniqueModels(append([]string{cfg.PrimaryModel}, cfg.TextFallbackModels...))
+}
+
+func executeTextFallback(callbackID string, cfg runtimeConfig, body []byte, event *comboEvent) (pluginapi.HostModelExecutionResponse, string, error) {
 	var lastErr error
-	for _, candidate := range cfg.VisionModels {
-		if !candidate.active() {
-			cfg.events.stage(event, "视觉候选跳过", "跳过", candidate.Model, "该候选模型已在配置中停用。", time.Now())
-			continue
+	models := textModels(cfg)
+	for index, model := range models {
+		started := time.Now()
+		response, err := hostExecute(callbackID, model, body, false)
+		if err == nil {
+			return response, model, nil
 		}
-		if estimateTokens(contextText)+cfg.VisionImageTokenReserve+cfg.VisionOutputTokens > candidate.ContextLimit {
-			lastErr = fmt.Errorf("vision model %s skipped: projected context exceeds %d", candidate.Model, candidate.ContextLimit)
-			cfg.events.stage(event, "视觉上下文预检", "跳过", candidate.Model, fmt.Sprintf("预测上下文超过该模型的 %d token 上限，未发送请求。", candidate.ContextLimit), time.Now())
-			continue
+		lastErr = err
+		detail := err.Error()
+		if index+1 < len(models) {
+			detail += "；尝试下一个文本备用模型。"
 		}
-		candidateStarted := time.Now()
-		request := makeVisionRequest(candidate.Model, cfg.VisionPrompt, contextText, asset.URL, cfg.VisionOutputTokens)
-		result, err := hostExecuteWithTimeout(callbackID, candidate.Model, request, cfg.VisionTimeoutSeconds)
-		if err != nil {
-			lastErr = err
-			cfg.events.stage(event, "视觉候选调用", "失败", candidate.Model, "调用失败，继续尝试下一个候选："+err.Error(), candidateStarted)
-			continue
-		}
-		description := extractVisionText(result.Body)
-		if description == "" {
-			lastErr = fmt.Errorf("vision model %s returned no usable text", candidate.Model)
-			cfg.events.stage(event, "视觉候选调用", "失败", candidate.Model, "返回为空，继续尝试下一个候选。", candidateStarted)
-			continue
-		}
-		cfg.cache.set(key, description, time.Duration(cfg.CacheTTLSeconds)*time.Second)
-		cfg.events.stage(event, "视觉识别完成", "完成", candidate.Model, "已提取视觉记忆：\n"+description, candidateStarted)
-		cfg.events.stage(event, "注入视觉记忆", "完成", cfg.PrimaryModel, "原始图片片段已替换为上方视觉记忆文本，随后继续由主文本模型完成任务。", time.Now())
-		return description, nil
+		cfg.events.stage(event, "文本候选调用", "失败", model, detail, started)
 	}
 	if lastErr == nil {
-		lastErr = fmt.Errorf("no enabled visual model is configured")
+		lastErr = fmt.Errorf("no text model is configured")
 	}
-	return "", lastErr
+	return pluginapi.HostModelExecutionResponse{}, models[len(models)-1], lastErr
 }
 
 func hostExecute(callbackID, model string, body []byte, stream bool) (pluginapi.HostModelExecutionResponse, error) {
@@ -370,56 +460,85 @@ func hostExecute(callbackID, model string, body []byte, stream bool) (pluginapi.
 	return response, nil
 }
 func hostExecuteWithTimeout(callbackID, model string, body []byte, seconds int) (pluginapi.HostModelExecutionResponse, error) {
-	type result struct {
-		response pluginapi.HostModelExecutionResponse
-		err      error
+	// The host-model ABI has no cancellation operation for a non-streaming
+	// execution. A local timer would return while the upstream call kept running,
+	// then start another candidate and create duplicate requests. The configured
+	// duration is therefore a soft latency budget: successful late results are
+	// accepted, and fallback starts only after the host call has actually failed.
+	started := time.Now()
+	response, err := hostExecute(callbackID, model, body, false)
+	if err != nil && seconds > 0 && time.Since(started) > time.Duration(seconds)*time.Second {
+		return response, fmt.Errorf("model %s failed after exceeding the %ds soft latency budget: %w", model, seconds, err)
 	}
-	done := make(chan result, 1)
-	go func() { r, e := hostExecute(callbackID, model, body, false); done <- result{r, e} }()
-	select {
-	case out := <-done:
-		return out.response, out.err
-	case <-time.After(time.Duration(seconds) * time.Second):
-		return pluginapi.HostModelExecutionResponse{}, fmt.Errorf("vision model %s timed out after %ds", model, seconds)
-	}
+	return response, err
 }
-func forwardPrimaryStream(streamID, callbackID, model string, body []byte) error {
+func forwardTextFallbackStream(streamID, callbackID string, cfg runtimeConfig, body []byte, event *comboEvent) (string, error) {
+	models := textModels(cfg)
+	var lastErr error
+	for index, model := range models {
+		started := time.Now()
+		emitted, err := forwardPrimaryStream(streamID, callbackID, model, body)
+		if err == nil {
+			return model, nil
+		}
+		lastErr = err
+		// Once bytes reached the client, switching models would duplicate or mix
+		// two answers in one stream. Fallback is therefore safe only before the
+		// first emitted chunk.
+		if emitted {
+			return model, err
+		}
+		detail := err.Error()
+		if index+1 < len(models) {
+			detail += "；尚未输出内容，安全切换到下一个文本备用模型。"
+		}
+		cfg.events.stage(event, "文本流候选", "失败", model, detail, started)
+	}
+	if lastErr == nil {
+		lastErr = fmt.Errorf("no text model is configured")
+	}
+	return models[len(models)-1], lastErr
+}
+
+func forwardPrimaryStream(streamID, callbackID, model string, body []byte) (bool, error) {
 	raw, err := callHost(pluginabi.MethodHostModelExecuteStream, hostModelRequest{HostModelExecutionRequest: pluginapi.HostModelExecutionRequest{EntryProtocol: "openai", ExitProtocol: "openai", Model: model, Stream: true, Body: body}, HostCallbackID: callbackID})
 	if err != nil {
-		return err
+		return false, err
 	}
 	var started pluginapi.HostModelStreamResponse
 	if err := json.Unmarshal(raw, &started); err != nil {
-		return err
+		return false, err
 	}
 	if started.StatusCode >= 400 {
-		return fmt.Errorf("primary model returned HTTP %d", started.StatusCode)
+		return false, fmt.Errorf("text model %s returned HTTP %d", model, started.StatusCode)
 	}
 	if started.StreamID == "" {
-		return fmt.Errorf("primary stream id is missing")
+		return false, fmt.Errorf("text model %s returned no stream id", model)
 	}
 	defer func() {
 		_, _ = callHost(pluginabi.MethodHostModelStreamClose, pluginapi.HostModelStreamCloseRequest{StreamID: started.StreamID})
 	}()
+	emitted := false
 	for {
 		chunkRaw, err := callHost(pluginabi.MethodHostModelStreamRead, pluginapi.HostModelStreamReadRequest{StreamID: started.StreamID})
 		if err != nil {
-			return err
+			return emitted, err
 		}
 		var chunk pluginapi.HostModelStreamReadResponse
 		if err := json.Unmarshal(chunkRaw, &chunk); err != nil {
-			return err
+			return emitted, err
 		}
 		if chunk.Error != "" {
-			return fmt.Errorf("primary stream error: %s", chunk.Error)
+			return emitted, fmt.Errorf("text stream error: %s", chunk.Error)
 		}
 		if len(chunk.Payload) > 0 {
 			if _, err = callHost(pluginabi.MethodHostStreamEmit, streamEmitRequest{StreamID: streamID, Payload: chunk.Payload}); err != nil {
-				return err
+				return emitted, err
 			}
+			emitted = true
 		}
 		if chunk.Done {
-			return nil
+			return emitted, nil
 		}
 	}
 }

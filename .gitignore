@@ -3,3 +3,7 @@ glm-vision-combo.so
 glm-vision-combo.h
 *.test
 .DS_Store
+management-preview*.html
+management-preview*.png
+management-settings*.png
+test-results/

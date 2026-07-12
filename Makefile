@@ -1,8 +1,9 @@
 PLUGIN := glm-vision-combo
-VERSION ?= 0.2.6
+VERSION ?= 0.3.0
 
 test:
 	go test ./...
+	go test -race ./...
 
 build-linux-amd64:
 	mkdir -p dist

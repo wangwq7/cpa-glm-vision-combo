@@ -134,10 +134,11 @@ func (s *eventStore) snapshot() []comboEvent {
 
 func abbreviateEventText(value string, max int) string {
 	value = strings.TrimSpace(strings.ReplaceAll(value, "\x00", ""))
-	if max <= 0 || len(value) <= max {
+	runes := []rune(value)
+	if max <= 0 || len(runes) <= max {
 		return value
 	}
-	return value[:max] + "…"
+	return string(runes[:max]) + "…"
 }
 
 func eventStatusRank(value string) int {
