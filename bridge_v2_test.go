@@ -111,7 +111,7 @@ func TestSingleFlightRunsExtractionOnce(t *testing.T) {
 func TestManagementPageContainsUnifiedControls(t *testing.T) {
 	runtime := testRuntime()
 	html := managementHTML(runtime)
-	for _, want := range []string{"路由预览", "历史图片策略", "自动压缩长对话", "文本备用模型 1", "强制 low", "保存并重新加载插件"} {
+	for _, want := range []string{"路由预览", "历史图片策略", "自动压缩长对话", "文本备用模型 1", "强制 low", "可取消识别超时", "取消确认等待", "vision_cancel_grace_seconds", "保存并重新加载插件"} {
 		if !strings.Contains(html, want) {
 			t.Fatalf("missing %q", want)
 		}

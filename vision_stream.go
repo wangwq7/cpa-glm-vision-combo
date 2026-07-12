@@ -1,0 +1,290 @@
+package main
+
+import (
+	"encoding/json"
+	"errors"
+	"fmt"
+	"strings"
+	"time"
+
+	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginabi"
+	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
+)
+
+type hostCallFunc func(string, any) (json.RawMessage, error)
+
+type visionStreamReadResult struct {
+	response pluginapi.HostModelStreamReadResponse
+	err      error
+}
+
+type visionStreamTimeoutError struct {
+	model   string
+	timeout time.Duration
+}
+
+func (e *visionStreamTimeoutError) Error() string {
+	return fmt.Sprintf("visual model %s exceeded the %s cancellable stream budget", e.model, e.timeout.Round(time.Millisecond))
+}
+
+type visionCancellationUnconfirmedError struct {
+	cause error
+}
+
+func (e *visionCancellationUnconfirmedError) Error() string {
+	if e == nil || e.cause == nil {
+		return "visual stream cancellation could not be confirmed"
+	}
+	return "visual stream cancellation could not be confirmed: " + e.cause.Error()
+}
+
+func (e *visionCancellationUnconfirmedError) Unwrap() error { return e.cause }
+
+func isVisionStreamTimeout(err error) bool {
+	var timeout *visionStreamTimeoutError
+	return errors.As(err, &timeout)
+}
+
+func isVisionCancellationUnconfirmed(err error) bool {
+	var unconfirmed *visionCancellationUnconfirmedError
+	return errors.As(err, &unconfirmed)
+}
+
+func hostExecuteVisionStreamWithTimeout(callbackID, model string, body []byte, seconds, graceSeconds int) (string, error) {
+	timeout := time.Duration(seconds) * time.Second
+	grace := time.Duration(graceSeconds) * time.Second
+	return executeVisionStreamWithTimeout(callbackID, model, body, timeout, grace, callHost)
+}
+
+// executeVisionStreamWithTimeout only starts its budget after the host has
+// returned a stream ID. The existing Host ABI exposes stream_close only at
+// that point; starting a second visual candidate earlier would recreate the
+// orphaned-request and duplicate-billing problem this path prevents.
+func executeVisionStreamWithTimeout(callbackID, model string, body []byte, timeout, grace time.Duration, invoke hostCallFunc) (string, error) {
+	if invoke == nil {
+		return "", fmt.Errorf("host callback is unavailable")
+	}
+	startedRaw, err := invoke(pluginabi.MethodHostModelExecuteStream, hostModelRequest{
+		HostModelExecutionRequest: pluginapi.HostModelExecutionRequest{
+			EntryProtocol: "openai",
+			ExitProtocol:  "openai",
+			Model:         model,
+			Stream:        true,
+			Body:          body,
+		},
+		HostCallbackID: callbackID,
+	})
+	if err != nil {
+		return "", err
+	}
+	var started pluginapi.HostModelStreamResponse
+	if err := json.Unmarshal(startedRaw, &started); err != nil {
+		return "", fmt.Errorf("decode visual stream start: %w", err)
+	}
+	if started.StatusCode >= 400 {
+		return "", fmt.Errorf("visual model %s returned HTTP %d while starting its stream", model, started.StatusCode)
+	}
+	if strings.TrimSpace(started.StreamID) == "" {
+		return "", fmt.Errorf("visual model %s returned no stream id", model)
+	}
+
+	streamID := started.StreamID
+	streamClosed := false
+	defer func() {
+		if !streamClosed {
+			_, _ = invoke(pluginabi.MethodHostModelStreamClose, pluginapi.HostModelStreamCloseRequest{StreamID: streamID})
+		}
+	}()
+
+	var timer *time.Timer
+	var timeoutC <-chan time.Time
+	if timeout > 0 {
+		timer = time.NewTimer(timeout)
+		timeoutC = timer.C
+		defer timer.Stop()
+	}
+
+	accumulator := &visionStreamAccumulator{}
+	for {
+		readResult := readVisionHostStream(invoke, streamID)
+		if timeoutC == nil {
+			result := <-readResult
+			if text, done, err := accumulator.consume(result); err != nil {
+				return "", err
+			} else if done {
+				return text, nil
+			}
+			continue
+		}
+
+		select {
+		case result := <-readResult:
+			if text, done, err := accumulator.consume(result); err != nil {
+				return "", err
+			} else if done {
+				return text, nil
+			}
+		case <-timeoutC:
+			// Prefer a completed read that raced the timer. It may contain the
+			// final event, in which case no cancellation or fallback is needed.
+			pendingRead := readResult
+			select {
+			case result := <-readResult:
+				if text, done, err := accumulator.consume(result); err != nil {
+					return "", err
+				} else if done {
+					return text, nil
+				}
+				// The raced read was only a queued non-terminal payload. Start
+				// another read so the close path can wait for a terminal ack.
+				pendingRead = readVisionHostStream(invoke, streamID)
+			default:
+			}
+
+			if err := closeAndConfirmVisionStream(invoke, streamID, pendingRead, grace); err != nil {
+				return "", &visionCancellationUnconfirmedError{cause: err}
+			}
+			streamClosed = true
+			return "", &visionStreamTimeoutError{model: model, timeout: timeout}
+		}
+	}
+}
+
+func readVisionHostStream(invoke hostCallFunc, streamID string) <-chan visionStreamReadResult {
+	result := make(chan visionStreamReadResult, 1)
+	go func() {
+		raw, err := invoke(pluginabi.MethodHostModelStreamRead, pluginapi.HostModelStreamReadRequest{StreamID: streamID})
+		if err != nil {
+			result <- visionStreamReadResult{err: err}
+			return
+		}
+		var response pluginapi.HostModelStreamReadResponse
+		if err := json.Unmarshal(raw, &response); err != nil {
+			result <- visionStreamReadResult{err: fmt.Errorf("decode visual stream chunk: %w", err)}
+			return
+		}
+		result <- visionStreamReadResult{response: response}
+	}()
+	return result
+}
+
+func closeAndConfirmVisionStream(invoke hostCallFunc, streamID string, pending <-chan visionStreamReadResult, grace time.Duration) error {
+	if _, err := invoke(pluginabi.MethodHostModelStreamClose, pluginapi.HostModelStreamCloseRequest{StreamID: streamID}); err != nil {
+		return fmt.Errorf("stream_close failed: %w", err)
+	}
+	if grace <= 0 {
+		grace = 15 * time.Second
+	}
+	deadline := time.NewTimer(grace)
+	defer deadline.Stop()
+	readResult := pending
+	for {
+		select {
+		case result := <-readResult:
+			if result.err != nil {
+				return fmt.Errorf("stream read did not return a terminal acknowledgement: %w", result.err)
+			}
+			if result.response.Done {
+				return nil
+			}
+			// A queued payload can arrive after close. Read again until the
+			// host confirms the stream has reached its terminal state.
+			readResult = readVisionHostStream(invoke, streamID)
+		case <-deadline.C:
+			return fmt.Errorf("stream did not acknowledge cancellation within %s", grace.Round(time.Millisecond))
+		}
+	}
+}
+
+func (a *visionStreamAccumulator) consume(result visionStreamReadResult) (string, bool, error) {
+	if result.err != nil {
+		return "", false, result.err
+	}
+	if result.response.Error != "" {
+		return "", false, fmt.Errorf("visual stream error: %s", result.response.Error)
+	}
+	a.add(result.response.Payload)
+	if !result.response.Done {
+		return "", false, nil
+	}
+	text := a.text()
+	if text == "" {
+		return "", false, fmt.Errorf("visual stream returned no usable text")
+	}
+	return text, true, nil
+}
+
+type visionStreamAccumulator struct {
+	pending  string
+	delta    strings.Builder
+	fallback strings.Builder
+}
+
+func (a *visionStreamAccumulator) add(payload []byte) {
+	a.pending += string(payload)
+	for {
+		index := strings.IndexByte(a.pending, '\n')
+		if index < 0 {
+			return
+		}
+		line := strings.TrimSuffix(a.pending[:index], "\r")
+		a.pending = a.pending[index+1:]
+		a.consumeLine(line)
+	}
+}
+
+func (a *visionStreamAccumulator) text() string {
+	if strings.TrimSpace(a.pending) != "" {
+		a.consumeLine(strings.TrimSuffix(a.pending, "\r"))
+		a.pending = ""
+	}
+	if text := strings.TrimSpace(a.delta.String()); text != "" {
+		return text
+	}
+	return strings.TrimSpace(a.fallback.String())
+}
+
+func (a *visionStreamAccumulator) consumeLine(line string) {
+	line = strings.TrimSpace(line)
+	if line == "" || line == "data: [DONE]" || line == "[DONE]" {
+		return
+	}
+	if strings.HasPrefix(line, "data:") {
+		line = strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+	}
+	if !strings.HasPrefix(line, "{") {
+		return
+	}
+	var root map[string]any
+	if json.Unmarshal([]byte(line), &root) != nil {
+		return
+	}
+	handledFallback := false
+	if delta, ok := root["delta"].(string); ok && delta != "" {
+		a.delta.WriteString(delta)
+	}
+	if choices, ok := root["choices"].([]any); ok && len(choices) > 0 {
+		if choice, ok := choices[0].(map[string]any); ok {
+			if delta, ok := choice["delta"].(map[string]any); ok {
+				if text := contentText(delta["content"]); text != "" {
+					a.delta.WriteString(text)
+				}
+			}
+			if message, ok := choice["message"].(map[string]any); ok {
+				if text := contentText(message["content"]); text != "" {
+					a.fallback.WriteString(text)
+					handledFallback = true
+				}
+			}
+			if text := contentText(choice["text"]); text != "" {
+				a.fallback.WriteString(text)
+				handledFallback = true
+			}
+		}
+	}
+	if !handledFallback {
+		if text := extractVisionText([]byte(line)); text != "" {
+			a.fallback.WriteString(text)
+		}
+	}
+}

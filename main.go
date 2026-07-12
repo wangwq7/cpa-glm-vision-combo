@@ -38,7 +38,7 @@ import (
 
 const pluginID = "glm-vision-combo"
 
-var pluginVersion = "0.3.1"
+var pluginVersion = "0.4.1"
 var configured atomic.Value
 var telemetry = newEventStore(100)
 
@@ -230,7 +230,8 @@ func metadata() pluginapi.Metadata {
 		{Name: "vision_models", Type: pluginapi.ConfigFieldTypeArray, Description: "高级视觉链：model、context_limit、context_budget、timeout_seconds、max_output_tokens、enabled。"},
 		{Name: "vision_input_token_budget", Type: pluginapi.ConfigFieldTypeInteger, Description: "视觉请求仅携带当前问题附近文字的最大预算。"},
 		{Name: "vision_output_tokens", Type: pluginapi.ConfigFieldTypeInteger, Description: "视觉识别输出上限。"},
-		{Name: "vision_timeout_seconds", Type: pluginapi.ConfigFieldTypeInteger, Description: "单个视觉候选超时时间。"},
+		{Name: "vision_timeout_seconds", Type: pluginapi.ConfigFieldTypeInteger, Description: "视觉流建立后、识别阶段的可取消超时时间。"},
+		{Name: "vision_cancel_grace_seconds", Type: pluginapi.ConfigFieldTypeInteger, Description: "调用 stream_close 后等待 Host 确认流已结束的最大秒数；未确认时不会启动备用模型。"},
 		{Name: "cache_ttl_seconds", Type: pluginapi.ConfigFieldTypeInteger, Description: "视觉记忆和历史摘要的持久缓存时长。"},
 		{Name: "cache_max_entries", Type: pluginapi.ConfigFieldTypeInteger, Description: "持久缓存最大条数，使用 LRU 淘汰。"},
 		{Name: "cache_path", Type: pluginapi.ConfigFieldTypeString, Description: "缓存文件路径。"},
@@ -391,13 +392,21 @@ func describeImage(cfg runtimeConfig, callbackID string, asset visualAsset, cont
 			}
 			candidateStarted := time.Now()
 			request := makeVisionRequest(candidate.Model, cfg.VisionPrompt, contextText, asset.URL, candidate.MaxOutputTokens)
-			result, err := hostExecuteWithTimeout(callbackID, lowThinkingModel(candidate.Model), request, candidate.TimeoutSeconds)
+			cfg.events.stage(event, "视觉候选调用", "进行中", candidate.Model, fmt.Sprintf("启动 CPA Host 视觉流；取得 stream ID 后启用 %d 秒可取消预算，取消确认最多等待 %d 秒。", candidate.TimeoutSeconds, cfg.VisionCancelGraceSeconds), candidateStarted)
+			description, err := hostExecuteVisionStreamWithTimeout(callbackID, lowThinkingModel(candidate.Model), request, candidate.TimeoutSeconds, cfg.VisionCancelGraceSeconds)
 			if err != nil {
 				lastErr = err
-				cfg.events.stage(event, "视觉候选调用", "失败", candidate.Model, "调用失败，继续尝试下一个候选："+err.Error(), candidateStarted)
+				if isVisionCancellationUnconfirmed(err) {
+					cfg.events.stage(event, "视觉取消确认", "失败", candidate.Model, "超时后未能确认上游流已结束；为避免重叠调用和重复计费，已停止本次视觉回退："+err.Error(), candidateStarted)
+					return "", err
+				}
+				detail := "调用失败，继续尝试下一个候选：" + err.Error()
+				if isVisionStreamTimeout(err) {
+					detail = "可取消识别阶段超时，已确认关闭上游流；安全尝试下一个候选。"
+				}
+				cfg.events.stage(event, "视觉候选调用", "失败", candidate.Model, detail, candidateStarted)
 				continue
 			}
-			description := extractVisionText(result.Body)
 			if description == "" {
 				lastErr = fmt.Errorf("vision model %s returned no usable text", candidate.Model)
 				cfg.events.stage(event, "视觉候选调用", "失败", candidate.Model, "返回为空，继续尝试下一个候选。", candidateStarted)
@@ -459,12 +468,11 @@ func hostExecute(callbackID, model string, body []byte, stream bool) (pluginapi.
 	}
 	return response, nil
 }
+
+// hostExecuteWithTimeout is retained for the history-compression path. The
+// non-streaming Host ABI has no cancellation primitive, so this is only a
+// latency annotation and must never be used for visual-model fallback.
 func hostExecuteWithTimeout(callbackID, model string, body []byte, seconds int) (pluginapi.HostModelExecutionResponse, error) {
-	// The host-model ABI has no cancellation operation for a non-streaming
-	// execution. A local timer would return while the upstream call kept running,
-	// then start another candidate and create duplicate requests. The configured
-	// duration is therefore a soft latency budget: successful late results are
-	// accepted, and fallback starts only after the host call has actually failed.
 	started := time.Now()
 	response, err := hostExecute(callbackID, model, body, false)
 	if err != nil && seconds > 0 && time.Since(started) > time.Duration(seconds)*time.Second {
@@ -472,6 +480,7 @@ func hostExecuteWithTimeout(callbackID, model string, body []byte, seconds int) 
 	}
 	return response, err
 }
+
 func forwardTextFallbackStream(streamID, callbackID string, cfg runtimeConfig, body []byte, event *comboEvent) (string, error) {
 	models := textModels(cfg)
 	var lastErr error

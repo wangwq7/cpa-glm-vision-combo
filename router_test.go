@@ -47,11 +47,31 @@ func TestVisionRequestAndResponse(t *testing.T) {
 	if err := json.Unmarshal(request, &decoded); err != nil {
 		t.Fatal(err)
 	}
-	if decoded["model"] != "vision(low)" || decoded["reasoning_effort"] != "low" {
+	if decoded["model"] != "vision(low)" || decoded["reasoning_effort"] != "low" || decoded["stream"] != true {
 		t.Fatal(decoded)
 	}
 	if got := extractVisionText([]byte(`{"choices":[{"message":{"content":"diagram: one box"}}]}`)); got != "diagram: one box" {
 		t.Fatal(got)
+	}
+}
+
+func TestVisionCancelGraceDefaultsAndCaps(t *testing.T) {
+	cfg := defaultPluginConfig()
+	cfg.VisionCancelGraceSeconds = 0
+	normalized, err := normalizeConfig(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if normalized.VisionCancelGraceSeconds != 15 {
+		t.Fatalf("default grace = %d, want 15", normalized.VisionCancelGraceSeconds)
+	}
+	cfg.VisionCancelGraceSeconds = 999
+	normalized, err = normalizeConfig(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if normalized.VisionCancelGraceSeconds != 120 {
+		t.Fatalf("capped grace = %d, want 120", normalized.VisionCancelGraceSeconds)
 	}
 }
 
@@ -112,6 +132,15 @@ func TestNamedVisionChainOverridesAdvancedList(t *testing.T) {
 	}
 	if got.VisionModels[0].ContextLimit != 256000 {
 		t.Fatalf("context limit = %d", got.VisionModels[0].ContextLimit)
+	}
+}
+
+func TestVisionChainCannotPointBackToCombo(t *testing.T) {
+	cfg := defaultPluginConfig()
+	cfg.VisionPrimaryModel = cfg.ComboModel
+	_, err := normalizeConfig(cfg)
+	if err == nil || !strings.Contains(err.Error(), "cannot point back to this combo") {
+		t.Fatalf("error = %v", err)
 	}
 }
 
