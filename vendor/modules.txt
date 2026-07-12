@@ -1,0 +1,7 @@
+# github.com/router-for-me/CLIProxyAPI/v7 v7.2.58
+## explicit; go 1.26.0
+github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginabi
+github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi
+# gopkg.in/yaml.v3 v3.0.1
+## explicit
+gopkg.in/yaml.v3

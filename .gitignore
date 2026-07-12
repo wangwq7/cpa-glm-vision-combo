@@ -1,0 +1,5 @@
+._*
+glm-vision-combo.so
+glm-vision-combo.h
+*.test
+.DS_Store
