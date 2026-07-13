@@ -38,7 +38,7 @@ import (
 
 const pluginID = "glm-vision-combo"
 
-var pluginVersion = "0.3.1"
+var pluginVersion = "0.3.2"
 var configured atomic.Value
 var telemetry = newEventStore(100)
 
@@ -216,8 +216,7 @@ func currentConfig() runtimeConfig {
 }
 func metadata() pluginapi.Metadata {
 	return pluginapi.Metadata{Name: "GLM Vision Bridge", Version: pluginVersion, Author: "wangwq7", GitHubRepository: "https://github.com/wangwq7/cpa-glm-vision-combo", ConfigFields: []pluginapi.ConfigField{
-		{Name: "combo_model", Type: pluginapi.ConfigFieldTypeString, Description: "对外暴露的主要虚拟模型名。"},
-		{Name: "combo_aliases", Type: pluginapi.ConfigFieldTypeArray, Description: "同一功能的额外对外模型名。"},
+		{Name: "combo_model", Type: pluginapi.ConfigFieldTypeString, Description: "对外暴露的唯一虚拟模型名。"},
 		{Name: "primary_model", Type: pluginapi.ConfigFieldTypeString, Description: "最终回答始终优先使用的文本模型。"},
 		{Name: "primary_context_tokens", Type: pluginapi.ConfigFieldTypeInteger, Description: "主文本模型理论上下文上限。"},
 		{Name: "primary_context_budget_tokens", Type: pluginapi.ConfigFieldTypeInteger, Description: "主模型实际工作预算，必须低于理论上限。"},
@@ -255,12 +254,22 @@ func pluginRegistration() registration {
 	return registration{SchemaVersion: pluginabi.SchemaVersion, Metadata: metadata(), Capabilities: capabilities{ModelProvider: true, ModelRouter: true, Executor: true, ExecutorModelScope: string(pluginapi.ExecutorModelScopeStatic), ExecutorInputFormats: []string{"openai"}, ExecutorOutputFormats: []string{"openai"}, ManagementAPI: true}}
 }
 func comboModels(cfg runtimeConfig) []pluginapi.ModelInfo {
-	names := append([]string{cfg.ComboModel}, cfg.ComboAliases...)
-	models := make([]pluginapi.ModelInfo, 0, len(names))
-	for _, name := range names {
-		models = append(models, pluginapi.ModelInfo{ID: name, Object: "model", OwnedBy: pluginID, Type: "chat", DisplayName: "GLM Vision Bridge", Description: "视觉模型只负责转写；最终任务始终由首选文本模型及其文本备用链完成。", ContextLength: int64(cfg.PrimaryContextTokens), MaxCompletionTokens: 16384, SupportedGenerationMethods: []string{"chat"}, SupportedInputModalities: []string{"text", "image"}, SupportedOutputModalities: []string{"text"}, UserDefined: true})
+	// Only expose the single configured combo_model. Aliases are ignored for
+	// /v1/models so clients always see one public entry point.
+	name := strings.TrimSpace(cfg.ComboModel)
+	if name == "" {
+		return nil
 	}
-	return models
+	return []pluginapi.ModelInfo{{
+		ID: name, Object: "model", OwnedBy: pluginID, Type: "chat",
+		DisplayName: "GLM Vision Bridge",
+		Description: "视觉模型只负责转写；最终任务始终由首选文本模型及其文本备用链完成。",
+		ContextLength: int64(cfg.PrimaryContextTokens), MaxCompletionTokens: 16384,
+		SupportedGenerationMethods: []string{"chat"},
+		SupportedInputModalities:   []string{"text", "image"},
+		SupportedOutputModalities:  []string{"text"},
+		UserDefined:                true,
+	}}
 }
 
 func routeModel(raw []byte) ([]byte, error) {
@@ -270,10 +279,8 @@ func routeModel(raw []byte) ([]byte, error) {
 	}
 	cfg := currentConfig()
 	requested := strings.TrimSpace(req.RequestedModel)
-	matched := requested == cfg.ComboModel
-	for _, alias := range cfg.ComboAliases {
-		matched = matched || requested == alias
-	}
+	// Route only the single public model name. Legacy aliases are no longer accepted.
+	matched := requested != "" && requested == strings.TrimSpace(cfg.ComboModel)
 	if !cfg.Enabled || req.SourceFormat != "openai" || !matched {
 		return okEnvelope(pluginapi.ModelRouteResponse{Handled: false})
 	}

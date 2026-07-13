@@ -115,6 +115,17 @@ func TestNamedVisionChainOverridesAdvancedList(t *testing.T) {
 	}
 }
 
+func TestNormalizeRejectsTextVisionModelOverlap(t *testing.T) {
+	cfg := defaultPluginConfig()
+	cfg.PrimaryModel = "glm-5.2"
+	cfg.TextFallbackModels = []string{"gpt-5.5", "gpt-5.6-terra"}
+	cfg.VisionPrimaryModel = "gpt-5.4-mini"
+	cfg.VisionBackupModel1 = "gpt-5.6-terra"
+	if _, err := normalizeConfig(cfg); err == nil || !strings.Contains(err.Error(), "both text and visual") {
+		t.Fatalf("expected text/vision overlap error, got %v", err)
+	}
+}
+
 func TestEventStoreKeepsBoundedSanitizedHistory(t *testing.T) {
 	store := newEventStore(1)
 	first := store.begin("combo", "glm", false)
