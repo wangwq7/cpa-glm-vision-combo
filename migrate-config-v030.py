@@ -22,8 +22,6 @@ block = """    glm-vision-combo:
       enabled: true
       priority: 100
       combo_model: glm-5.2-vision-combo
-      combo_aliases:
-        - glm-vision-bridge
 
       primary_model: glm-5.2
       primary_context_tokens: 1048576

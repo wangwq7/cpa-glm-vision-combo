@@ -81,7 +81,7 @@ func defaultPluginConfig() pluginConfig {
 	return pluginConfig{
 		Enabled:                        true,
 		ComboModel:                     "glm-5.2-vision-combo",
-		ComboAliases:                   []string{"glm-vision-bridge"},
+		ComboAliases:                   nil,
 		PrimaryModel:                   "glm-5.2",
 		VisionPrimaryModel:             "gpt-5.4-mini",
 		PrimaryContextTokens:           1048576,
@@ -197,7 +197,8 @@ func normalizeConfig(cfg pluginConfig) (pluginConfig, error) {
 		cfg.StrictVisionFailure = true
 	}
 
-	cfg.ComboAliases = uniqueModels(cfg.ComboAliases, cfg.ComboModel)
+	// Single public model only: keep combo_model, drop any historical aliases.
+	cfg.ComboAliases = nil
 	cfg.TextFallbackModels = uniqueModels(cfg.TextFallbackModels, cfg.PrimaryModel)
 	clean := make([]visionModel, 0, len(cfg.VisionModels))
 	for _, item := range cfg.VisionModels {

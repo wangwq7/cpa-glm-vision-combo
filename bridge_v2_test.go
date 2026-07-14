@@ -128,11 +128,12 @@ func TestRenderManagementPreview(t *testing.T) {
 	}
 }
 
-func TestComboAliasesAreExposed(t *testing.T) {
+func TestSingleComboModelIsExposed(t *testing.T) {
 	runtime := testRuntime()
+	runtime.ComboAliases = []string{"glm-vision-bridge", "legacy-alias"}
 	models := comboModels(runtime)
-	raw, _ := json.Marshal(models)
-	if !strings.Contains(string(raw), "glm-5.2-vision-combo") || !strings.Contains(string(raw), "glm-vision-bridge") {
-		t.Fatalf("models=%s", raw)
+	if len(models) != 1 || models[0].ID != "glm-5.2-vision-combo" {
+		raw, _ := json.Marshal(models)
+		t.Fatalf("expected only combo_model, got %s", raw)
 	}
 }
