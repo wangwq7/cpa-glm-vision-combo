@@ -96,7 +96,8 @@ func TestCachedHistoricalImageIsCompactedWithoutVisionCall(t *testing.T) {
 	var root any
 	_ = json.Unmarshal(raw, &root)
 	asset := collectVisualAssets(root)[0]
-	r.cache.set(visualCacheKey(r, asset), "vision", "cached visual memory with details", time.Hour)
+	context := trimToTokens(nearbyUserTask(root, asset), r.VisionInputTokenBudget)
+	r.cache.set(visualCacheKey(r, asset, context), "vision", "cached visual memory with details", time.Hour)
 	calls := 0
 	got, _, err := transformOpenAIRequest(raw, r, func(visualAsset, string) (string, error) { calls++; return "", nil })
 	if err != nil || calls != 0 || !strings.Contains(string(got), "历史图片附件已归档") || strings.Contains(string(got), "data:image") {

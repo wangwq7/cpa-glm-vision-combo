@@ -28,6 +28,61 @@ func TestVisionStreamAccumulatorHandlesSplitSSEChunks(t *testing.T) {
 	}
 }
 
+func TestVisionStreamAccumulatorHandlesFramesWithoutTrailingNewlines(t *testing.T) {
+	accumulator := &visionStreamAccumulator{}
+	accumulator.add([]byte(`data: {"choices":[{"delta":{"content":"OCR: "}}]}`))
+	accumulator.add([]byte(`data: {"choices":[{"delta":{"content":"screen"}}]}`))
+	accumulator.add([]byte(`data: {"choices":[{"delta":{"content":"shot"}}]}`))
+	if got := accumulator.text(); got != "OCR: screenshot" {
+		t.Fatalf("text = %q", got)
+	}
+}
+
+func TestVisionStreamAccumulatorHandlesProviderStreamDialects(t *testing.T) {
+	tests := []struct {
+		name   string
+		chunks []string
+		want   string
+	}{
+		{
+			name: "openai responses",
+			chunks: []string{
+				`data: {"type":"response.reasoning_summary_text.delta","delta":"ignore me"}`,
+				`data: {"type":"response.output_text.delta","delta":"visible "}`,
+				`data: {"type":"response.output_text.delta","delta":"text"}`,
+			},
+			want: "visible text",
+		},
+		{
+			name: "anthropic",
+			chunks: []string{
+				`data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"claude "}}`,
+				`data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"text"}}`,
+			},
+			want: "claude text",
+		},
+		{
+			name: "gemini antigravity",
+			chunks: []string{
+				`data: {"response":{"candidates":[{"content":{"parts":[{"thought":true,"text":"ignore"},{"text":"gemini "}]}}]}}`,
+				`data: {"response":{"candidates":[{"content":{"parts":[{"text":"text"}]}}]}}`,
+			},
+			want: "gemini text",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			accumulator := &visionStreamAccumulator{}
+			for _, chunk := range test.chunks {
+				accumulator.add([]byte(chunk))
+			}
+			if got := accumulator.text(); got != test.want {
+				t.Fatalf("text = %q, want %q", got, test.want)
+			}
+		})
+	}
+}
+
 func TestExecuteVisionStreamReturnsTextFromHostStream(t *testing.T) {
 	var mu sync.Mutex
 	read := 0

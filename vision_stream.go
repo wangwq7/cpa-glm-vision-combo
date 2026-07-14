@@ -225,23 +225,46 @@ func (a *visionStreamAccumulator) add(payload []byte) {
 	for {
 		index := strings.IndexByte(a.pending, '\n')
 		if index < 0 {
-			return
+			break
 		}
 		line := strings.TrimSuffix(a.pending[:index], "\r")
 		a.pending = a.pending[index+1:]
 		a.consumeLine(line)
 	}
+	// CPA commonly exposes one complete SSE data frame per Host stream read
+	// without preserving the trailing newline. Consume a complete frame at the
+	// read boundary while retaining genuinely split JSON for the next read.
+	a.consumeCompletePendingFrame()
 }
 
 func (a *visionStreamAccumulator) text() string {
 	if strings.TrimSpace(a.pending) != "" {
-		a.consumeLine(strings.TrimSuffix(a.pending, "\r"))
-		a.pending = ""
+		a.consumeCompletePendingFrame()
 	}
 	if text := strings.TrimSpace(a.delta.String()); text != "" {
 		return text
 	}
 	return strings.TrimSpace(a.fallback.String())
+}
+
+func (a *visionStreamAccumulator) consumeCompletePendingFrame() {
+	line := strings.TrimSpace(strings.TrimSuffix(a.pending, "\r"))
+	if line == "" {
+		a.pending = ""
+		return
+	}
+	if strings.HasPrefix(line, "event:") && !strings.Contains(line, "{") {
+		a.pending = ""
+		return
+	}
+	candidate := line
+	if strings.HasPrefix(candidate, "data:") {
+		candidate = strings.TrimSpace(strings.TrimPrefix(candidate, "data:"))
+	}
+	if candidate == "[DONE]" || json.Valid([]byte(candidate)) {
+		a.pending = ""
+		a.consumeLine(line)
+	}
 }
 
 func (a *visionStreamAccumulator) consumeLine(line string) {
@@ -260,8 +283,16 @@ func (a *visionStreamAccumulator) consumeLine(line string) {
 		return
 	}
 	handledFallback := false
-	if delta, ok := root["delta"].(string); ok && delta != "" {
+	eventType := strings.ToLower(strings.TrimSpace(stringValue(root["type"])))
+	if delta, ok := root["delta"].(string); ok && delta != "" && (eventType == "" || eventType == "response.output_text.delta") {
 		a.delta.WriteString(delta)
+	}
+	if eventType == "content_block_delta" {
+		if delta, ok := root["delta"].(map[string]any); ok {
+			if text := stringValue(delta["text"]); text != "" {
+				a.delta.WriteString(text)
+			}
+		}
 	}
 	if choices, ok := root["choices"].([]any); ok && len(choices) > 0 {
 		if choice, ok := choices[0].(map[string]any); ok {
@@ -282,9 +313,51 @@ func (a *visionStreamAccumulator) consumeLine(line string) {
 			}
 		}
 	}
-	if !handledFallback {
-		if text := extractVisionText([]byte(line)); text != "" {
-			a.fallback.WriteString(text)
+	if response, ok := root["response"].(map[string]any); ok {
+		if text := geminiStreamText(response); text != "" {
+			a.delta.WriteString(text)
 		}
 	}
+	if eventType == "response.output_text.done" {
+		if text := stringValue(root["text"]); text != "" {
+			a.writeFallback(text)
+			handledFallback = true
+		}
+	}
+	if part, ok := root["part"].(map[string]any); ok {
+		if text := stringValue(part["text"]); text != "" {
+			a.writeFallback(text)
+			handledFallback = true
+		}
+	}
+	if !handledFallback {
+		if text := extractVisionText([]byte(line)); text != "" {
+			a.writeFallback(text)
+		}
+	}
+}
+
+func (a *visionStreamAccumulator) writeFallback(text string) {
+	if a.fallback.Len() == 0 {
+		a.fallback.WriteString(text)
+	}
+}
+
+func geminiStreamText(response map[string]any) string {
+	candidates, _ := response["candidates"].([]any)
+	if len(candidates) == 0 {
+		return ""
+	}
+	candidate, _ := candidates[0].(map[string]any)
+	content, _ := candidate["content"].(map[string]any)
+	parts, _ := content["parts"].([]any)
+	var text strings.Builder
+	for _, rawPart := range parts {
+		part, _ := rawPart.(map[string]any)
+		if thought, _ := part["thought"].(bool); thought {
+			continue
+		}
+		text.WriteString(stringValue(part["text"]))
+	}
+	return text.String()
 }

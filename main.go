@@ -38,7 +38,7 @@ import (
 
 const pluginID = "glm-vision-combo"
 
-var pluginVersion = "0.4.1"
+var pluginVersion = "0.4.2"
 var configured atomic.Value
 var telemetry = newEventStore(100)
 
@@ -253,7 +253,7 @@ func metadata() pluginapi.Metadata {
 	}}
 }
 func pluginRegistration() registration {
-	return registration{SchemaVersion: pluginabi.SchemaVersion, Metadata: metadata(), Capabilities: capabilities{ModelProvider: true, ModelRouter: true, Executor: true, ExecutorModelScope: string(pluginapi.ExecutorModelScopeStatic), ExecutorInputFormats: []string{"openai"}, ExecutorOutputFormats: []string{"openai"}, ManagementAPI: true}}
+	return registration{SchemaVersion: pluginabi.SchemaVersion, Metadata: metadata(), Capabilities: capabilities{ModelProvider: true, ModelRouter: true, Executor: true, ExecutorModelScope: string(pluginapi.ExecutorModelScopeStatic), ExecutorInputFormats: []string{"openai", "claude"}, ExecutorOutputFormats: []string{"openai", "claude"}, ManagementAPI: true}}
 }
 func comboModels(cfg runtimeConfig) []pluginapi.ModelInfo {
 	names := append([]string{cfg.ComboModel}, cfg.ComboAliases...)
@@ -275,21 +275,46 @@ func routeModel(raw []byte) ([]byte, error) {
 	for _, alias := range cfg.ComboAliases {
 		matched = matched || requested == alias
 	}
-	if !cfg.Enabled || req.SourceFormat != "openai" || !matched {
+	protocol := normalizeProtocol(req.SourceFormat)
+	if !cfg.Enabled || !isSupportedProtocol(protocol) || !matched {
 		return okEnvelope(pluginapi.ModelRouteResponse{Handled: false})
 	}
 	return okEnvelope(pluginapi.ModelRouteResponse{Handled: true, TargetKind: pluginapi.ModelRouteTargetSelf, Reason: "glm_vision_combo_orchestration"})
 }
+
+func normalizeProtocol(value string) string {
+	return strings.ToLower(strings.TrimSpace(value))
+}
+
+func isSupportedProtocol(value string) bool {
+	return value == "openai" || value == "claude"
+}
+
+func executorProtocol(req rpcExecutorRequest) (string, error) {
+	protocol := normalizeProtocol(req.SourceFormat)
+	if protocol == "" {
+		protocol = normalizeProtocol(req.Format)
+	}
+	if !isSupportedProtocol(protocol) {
+		return "", fmt.Errorf("unsupported executor protocol %q", protocol)
+	}
+	return protocol, nil
+}
+
 func execute(raw []byte) ([]byte, error) {
 	var req rpcExecutorRequest
 	if err := json.Unmarshal(raw, &req); err != nil {
 		return nil, err
 	}
+	protocol, err := executorProtocol(req)
+	if err != nil {
+		return nil, err
+	}
 	cfg := currentConfig()
 	event := cfg.events.begin(req.Model, cfg.PrimaryModel, false)
 	started := time.Now()
-	cfg.events.stage(event, "接收组合请求", "完成", req.Model, "已识别 OpenAI 请求，开始检查多模态内容。", started)
-	body, images, err := preparePrimaryBody(req.OriginalRequest, cfg, req.HostCallbackID, event)
+	cfg.events.stage(event, "接收组合请求", "完成", req.Model, fmt.Sprintf("已识别 %s 请求，开始检查多模态内容。", protocol), started)
+	body, images, err := preparePrimaryBody(req.OriginalRequest, protocol, cfg, req.HostCallbackID, event)
 	cfg.events.setImageCount(event, images)
 	if images == 0 {
 		cfg.events.stage(event, "纯文本直达", "完成", cfg.PrimaryModel, "未检测到图片，跳过视觉候选链。", time.Now())
@@ -307,7 +332,7 @@ func execute(raw []byte) ([]byte, error) {
 	}
 	primaryStarted := time.Now()
 	cfg.events.stage(event, "交给文本模型链", "完成", cfg.PrimaryModel, "请求已完成附件处理与上下文预算检查；图片不会进入文本模型。", primaryStarted)
-	response, usedModel, err := executeTextFallback(req.HostCallbackID, cfg, body, event)
+	response, usedModel, err := executeTextFallback(req.HostCallbackID, cfg, body, protocol, event)
 	if err != nil {
 		cfg.events.stage(event, "文本模型链返回", "失败", usedModel, err.Error(), primaryStarted)
 		cfg.events.finish(event, err)
@@ -325,12 +350,16 @@ func executeStream(raw []byte) ([]byte, error) {
 	if strings.TrimSpace(req.StreamID) == "" {
 		return errorEnvelope("executor_error", "stream_id is required", false), nil
 	}
+	protocol, err := executorProtocol(req)
+	if err != nil {
+		return nil, err
+	}
 	cfg := currentConfig()
 	event := cfg.events.begin(req.Model, cfg.PrimaryModel, true)
 	go func() {
 		started := time.Now()
-		cfg.events.stage(event, "接收组合请求", "完成", req.Model, "已识别流式 OpenAI 请求，开始检查多模态内容。", started)
-		body, images, err := preparePrimaryBody(req.OriginalRequest, cfg, req.HostCallbackID, event)
+		cfg.events.stage(event, "接收组合请求", "完成", req.Model, fmt.Sprintf("已识别流式 %s 请求，开始检查多模态内容。", protocol), started)
+		body, images, err := preparePrimaryBody(req.OriginalRequest, protocol, cfg, req.HostCallbackID, event)
 		cfg.events.setImageCount(event, images)
 		if images == 0 {
 			cfg.events.stage(event, "纯文本直达", "完成", cfg.PrimaryModel, "未检测到图片，跳过视觉候选链。", time.Now())
@@ -342,7 +371,7 @@ func executeStream(raw []byte) ([]byte, error) {
 			primaryStarted := time.Now()
 			cfg.events.stage(event, "交给文本模型链", "完成", cfg.PrimaryModel, "请求已完成附件处理与上下文预算检查，开始透传输出流。", primaryStarted)
 			var usedModel string
-			usedModel, err = forwardTextFallbackStream(req.StreamID, req.HostCallbackID, cfg, body, event)
+			usedModel, err = forwardTextFallbackStream(req.StreamID, req.HostCallbackID, cfg, body, protocol, event)
 			if err != nil {
 				cfg.events.stage(event, "文本流结束", "失败", usedModel, err.Error(), primaryStarted)
 			} else {
@@ -357,11 +386,11 @@ func executeStream(raw []byte) ([]byte, error) {
 	return okEnvelope(map[string]any{"headers": http.Header{"Content-Type": []string{"text/event-stream"}}})
 }
 
-func preparePrimaryBody(raw []byte, cfg runtimeConfig, callbackID string, event *comboEvent) ([]byte, int, error) {
+func preparePrimaryBody(raw []byte, protocol string, cfg runtimeConfig, callbackID string, event *comboEvent) ([]byte, int, error) {
 	if len(raw) == 0 {
-		return nil, 0, fmt.Errorf("original OpenAI request is missing")
+		return nil, 0, fmt.Errorf("original %s request is missing", protocol)
 	}
-	return transformOpenAIRequest(raw, cfg, func(asset visualAsset, contextText string) (string, error) {
+	return transformRequest(raw, protocol, cfg, func(asset visualAsset, contextText string) (string, error) {
 		return describeImage(cfg, callbackID, asset, contextText, event)
 	})
 }
@@ -369,7 +398,7 @@ func describeImage(cfg runtimeConfig, callbackID string, asset visualAsset, cont
 	if err := validateAsset(asset.URL, cfg); err != nil {
 		return "", err
 	}
-	key := visualCacheKey(cfg, asset)
+	key := visualCacheKey(cfg, asset, contextText)
 	if key != "" {
 		if cached, ok := cfg.cache.get(key); ok {
 			cfg.events.stage(event, "读取视觉记忆缓存", "完成", "缓存", "同一图片命中本地内存缓存，未再次调用视觉模型。", time.Now())
@@ -432,12 +461,12 @@ func textModels(cfg runtimeConfig) []string {
 	return uniqueModels(append([]string{cfg.PrimaryModel}, cfg.TextFallbackModels...))
 }
 
-func executeTextFallback(callbackID string, cfg runtimeConfig, body []byte, event *comboEvent) (pluginapi.HostModelExecutionResponse, string, error) {
+func executeTextFallback(callbackID string, cfg runtimeConfig, body []byte, protocol string, event *comboEvent) (pluginapi.HostModelExecutionResponse, string, error) {
 	var lastErr error
 	models := textModels(cfg)
 	for index, model := range models {
 		started := time.Now()
-		response, err := hostExecute(callbackID, model, body, false)
+		response, err := hostExecuteProtocol(callbackID, model, body, false, protocol)
 		if err == nil {
 			return response, model, nil
 		}
@@ -455,7 +484,11 @@ func executeTextFallback(callbackID string, cfg runtimeConfig, body []byte, even
 }
 
 func hostExecute(callbackID, model string, body []byte, stream bool) (pluginapi.HostModelExecutionResponse, error) {
-	raw, err := callHost(pluginabi.MethodHostModelExecute, hostModelRequest{HostModelExecutionRequest: pluginapi.HostModelExecutionRequest{EntryProtocol: "openai", ExitProtocol: "openai", Model: model, Stream: stream, Body: body}, HostCallbackID: callbackID})
+	return hostExecuteProtocol(callbackID, model, body, stream, "openai")
+}
+
+func hostExecuteProtocol(callbackID, model string, body []byte, stream bool, protocol string) (pluginapi.HostModelExecutionResponse, error) {
+	raw, err := callHost(pluginabi.MethodHostModelExecute, makeHostModelRequest(callbackID, protocol, model, body, stream))
 	if err != nil {
 		return pluginapi.HostModelExecutionResponse{}, err
 	}
@@ -467,6 +500,19 @@ func hostExecute(callbackID, model string, body []byte, stream bool) (pluginapi.
 		return response, fmt.Errorf("upstream model %s returned HTTP %d", model, response.StatusCode)
 	}
 	return response, nil
+}
+
+func makeHostModelRequest(callbackID, protocol, model string, body []byte, stream bool) hostModelRequest {
+	return hostModelRequest{
+		HostModelExecutionRequest: pluginapi.HostModelExecutionRequest{
+			EntryProtocol: protocol,
+			ExitProtocol:  protocol,
+			Model:         model,
+			Stream:        stream,
+			Body:          body,
+		},
+		HostCallbackID: callbackID,
+	}
 }
 
 // hostExecuteWithTimeout is retained for the history-compression path. The
@@ -481,12 +527,12 @@ func hostExecuteWithTimeout(callbackID, model string, body []byte, seconds int) 
 	return response, err
 }
 
-func forwardTextFallbackStream(streamID, callbackID string, cfg runtimeConfig, body []byte, event *comboEvent) (string, error) {
+func forwardTextFallbackStream(streamID, callbackID string, cfg runtimeConfig, body []byte, protocol string, event *comboEvent) (string, error) {
 	models := textModels(cfg)
 	var lastErr error
 	for index, model := range models {
 		started := time.Now()
-		emitted, err := forwardPrimaryStream(streamID, callbackID, model, body)
+		emitted, err := forwardPrimaryStream(streamID, callbackID, model, body, protocol)
 		if err == nil {
 			return model, nil
 		}
@@ -509,8 +555,8 @@ func forwardTextFallbackStream(streamID, callbackID string, cfg runtimeConfig, b
 	return models[len(models)-1], lastErr
 }
 
-func forwardPrimaryStream(streamID, callbackID, model string, body []byte) (bool, error) {
-	raw, err := callHost(pluginabi.MethodHostModelExecuteStream, hostModelRequest{HostModelExecutionRequest: pluginapi.HostModelExecutionRequest{EntryProtocol: "openai", ExitProtocol: "openai", Model: model, Stream: true, Body: body}, HostCallbackID: callbackID})
+func forwardPrimaryStream(streamID, callbackID, model string, body []byte, protocol string) (bool, error) {
+	raw, err := callHost(pluginabi.MethodHostModelExecuteStream, makeHostModelRequest(callbackID, protocol, model, body, true))
 	if err != nil {
 		return false, err
 	}
