@@ -188,15 +188,18 @@ func cpaLocalAPISettings(configYAML []byte) (int, string) {
 func managementHTML(cfg runtimeConfig) (page string) {
 	defer func() {
 		page = strings.NewReplacer(
-			"CPA 原生插件 · 视觉桥接 v0.3", "CPA 原生插件 · 视觉桥接 v0.4.1",
+			"CPA 原生插件 · 视觉桥接 v0.3.2", "CPA 原生插件 · 视觉桥接 v"+pluginVersion,
+			"视觉模型只负责把图片转成不可信的事实文本；主任务仍由首选文本模型完成。历史图片按需恢复，长对话超过阈值后自动压缩。", "自动适配 OpenAI Chat 与 Claude Messages 协议。视觉模型只负责把图片转成不可信的事实文本；主任务仍由首选文本模型完成。",
 			`<div class="field"><label>单模型软延迟预算（秒）</label><input type="number" name="vision_timeout_seconds"><small>用于观测慢调用。CPA Host 暂不支持取消；插件会接收成功的迟到结果，避免后台遗留请求与重复计费。</small></div>`,
-			`<div class="field"><label>可取消识别超时（秒）</label><input type="number" name="vision_timeout_seconds"><small>仅在 CPA Host 返回 stream ID 后开始计时。超时会调用现有 stream_close，确认流结束后才会使用备用视觉模型。</small></div><div class="field"><label>取消确认等待（秒）</label><input type="number" name="vision_cancel_grace_seconds"><small>关闭请求后等待 Host 确认流已结束的最长时间。若未确认，本次直接报错，不会启动备用模型或产生重叠调用。</small></div>`,
+			`<div class="field"><label>可取消识别超时（秒）</label><input type="number" name="vision_timeout_seconds"><small>Host 返回 stream ID 后开始计时；超时会关闭并确认该视觉流。</small></div><div class="field"><label>取消确认等待（秒）</label><input type="number" name="vision_cancel_grace_seconds"><small>未在时限内确认关闭时直接失败，不启动备用模型，避免重叠调用。</small></div>`,
 			"setValue('vision_timeout_seconds',C.vision_timeout_seconds);setValue('vision_input_token_budget'",
 			"setValue('vision_timeout_seconds',C.vision_timeout_seconds);setValue('vision_cancel_grace_seconds',C.vision_cancel_grace_seconds);setValue('vision_input_token_budget'",
 			"vision_timeout_seconds:n('vision_timeout_seconds'),cache_ttl_seconds",
 			"vision_timeout_seconds:n('vision_timeout_seconds'),vision_cancel_grace_seconds:n('vision_cancel_grace_seconds'),cache_ttl_seconds",
+			`<div class="note"><strong>图片轮：</strong>同图命中缓存不重复识别；同一时刻的重复请求会合并。</div>`,
+			`<div class="note"><strong>图片轮：</strong>缓存键包含图片与附近任务；同图不同问题不会误用识别重点。</div>`,
 			`<div class="note"><strong>失败策略：</strong>单个视觉模型失败自动尝试下一个；全部失败时按严格策略返回错误。</div>`,
-			`<div class="note"><strong>失败策略：</strong>取得 stream ID 后超时会真实关闭并确认结束，再尝试下一个；流启动阶段不会冒险并发 fallback。</div>`,
+			`<div class="note"><strong>失败策略：</strong>取得 stream ID 后超时会关闭并确认结束，再尝试下一个；不会并发 fallback。</div>`,
 		).Replace(page)
 	}()
 	events := cfg.events.snapshot()
