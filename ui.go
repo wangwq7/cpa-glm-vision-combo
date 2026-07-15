@@ -190,8 +190,9 @@ func managementHTML(cfg runtimeConfig) (page string) {
 		page = strings.NewReplacer(
 			"CPA 原生插件 · 视觉桥接 v0.3.2", "CPA 原生插件 · 视觉桥接 v"+pluginVersion,
 			"视觉模型只负责把图片转成不可信的事实文本；主任务仍由首选文本模型完成。历史图片按需恢复，长对话超过阈值后自动压缩。", "自动适配 OpenAI Chat 与 Claude Messages 协议。视觉模型只负责把图片转成不可信的事实文本；主任务仍由首选文本模型完成。",
+			"图片轮首先调用；建议选择延迟较低、截图 OCR 稳定的模型。", "图片轮首先调用；按实际截图的准确率和完成耗时排序。",
 			`<div class="field"><label>单模型软延迟预算（秒）</label><input type="number" name="vision_timeout_seconds"><small>用于观测慢调用。CPA Host 暂不支持取消；插件会接收成功的迟到结果，避免后台遗留请求与重复计费。</small></div>`,
-			`<div class="field"><label>可取消识别超时（秒）</label><input type="number" name="vision_timeout_seconds"><small>Host 返回 stream ID 后开始计时；超时会关闭并确认该视觉流。</small></div><div class="field"><label>取消确认等待（秒）</label><input type="number" name="vision_cancel_grace_seconds"><small>未在时限内确认关闭时直接失败，不启动备用模型，避免重叠调用。</small></div>`,
+			`<div class="field"><label>可取消识别超时（秒）</label><input type="number" name="vision_timeout_seconds"><small>Host 返回 stream ID 后开始计时；生产实测推荐 20 秒，超时会关闭并确认该视觉流。</small></div><div class="field"><label>取消确认等待（秒）</label><input type="number" name="vision_cancel_grace_seconds"><small>生产建议保持 15 秒；未确认关闭时不启动备用模型，避免重叠调用。</small></div>`,
 			"setValue('vision_timeout_seconds',C.vision_timeout_seconds);setValue('vision_input_token_budget'",
 			"setValue('vision_timeout_seconds',C.vision_timeout_seconds);setValue('vision_cancel_grace_seconds',C.vision_cancel_grace_seconds);setValue('vision_input_token_budget'",
 			"vision_timeout_seconds:n('vision_timeout_seconds'),cache_ttl_seconds",

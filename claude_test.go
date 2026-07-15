@@ -97,6 +97,16 @@ func TestVisualCacheKeyIncludesNearbyTask(t *testing.T) {
 	}
 }
 
+func TestVisualCacheKeyIncludesModelProfile(t *testing.T) {
+	first := testRuntime()
+	second := testRuntime()
+	second.VisionModels[0].Model = "different-vision-model"
+	asset := visualAsset{URL: "data:image/png;base64,YQ=="}
+	if visualCacheKey(first, asset, "读取错误代码") == visualCacheKey(second, asset, "读取错误代码") {
+		t.Fatal("changing the visual model profile must invalidate cached descriptions")
+	}
+}
+
 func TestUnsupportedMediaFailsBeforeAnyVisionCall(t *testing.T) {
 	runtime := testRuntime()
 	raw := []byte(`{"messages":[{"role":"user","content":[

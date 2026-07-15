@@ -26,16 +26,19 @@ block = """    glm-vision-combo:
       primary_model: glm-5.2
       primary_context_tokens: 1048576
       primary_context_budget_tokens: 930000
-      text_fallback_models: []
+      text_fallback_models:
+        - gpt-5.5
+        - gpt-5.6-sol
 
-      vision_primary_model: gpt-5.4-mini
-      vision_backup_model_1: gpt-5.6-luna
-      vision_backup_model_2: claude-sonnet-4-6
-      vision_backup_model_3: gemini-3.1-flash-lite
-      vision_context_limit: 256000
+      vision_primary_model: gemini-3.1-flash-lite
+      vision_backup_model_1: gpt-5.6-terra
+      vision_backup_model_2: grok-4.5
+      vision_backup_model_3: claude-sonnet-4-6
+      vision_context_limit: 262144
       vision_input_token_budget: 1200
       vision_output_tokens: 4000
       vision_timeout_seconds: 20
+      vision_cancel_grace_seconds: 15
 
       history_attachment_mode: onDemand
       history_attachment_compact_chars: 600

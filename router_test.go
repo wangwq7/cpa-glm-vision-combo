@@ -13,6 +13,50 @@ func testRuntime() runtimeConfig {
 	return runtimeConfig{pluginConfig: normalized, cache: newMemoCache(8, ""), events: newEventStore(100)}
 }
 
+func TestDefaultConfigUsesBenchmarkedProductionProfile(t *testing.T) {
+	cfg, err := normalizeConfig(defaultPluginConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.PrimaryModel != "glm-5.2" || len(cfg.TextFallbackModels) != 2 || cfg.TextFallbackModels[0] != "gpt-5.5" || cfg.TextFallbackModels[1] != "gpt-5.6-sol" {
+		t.Fatalf("unexpected text chain: primary=%q fallbacks=%#v", cfg.PrimaryModel, cfg.TextFallbackModels)
+	}
+	wantVision := []string{"gemini-3.1-flash-lite", "gpt-5.6-terra", "grok-4.5", "claude-sonnet-4-6"}
+	if len(cfg.VisionModels) != len(wantVision) {
+		t.Fatalf("unexpected visual chain: %#v", cfg.VisionModels)
+	}
+	for index, want := range wantVision {
+		if cfg.VisionModels[index].Model != want {
+			t.Fatalf("visual model %d = %q, want %q", index, cfg.VisionModels[index].Model, want)
+		}
+	}
+	if cfg.VisionTimeoutSeconds != 20 || cfg.VisionCancelGraceSeconds != 15 {
+		t.Fatalf("unexpected visual timing: timeout=%d grace=%d", cfg.VisionTimeoutSeconds, cfg.VisionCancelGraceSeconds)
+	}
+}
+
+func TestDefaultVisionPromptRequiresVerbatimOCR(t *testing.T) {
+	for _, instruction := range []string{"Accuracy has priority over brevity", "timestamp", "table cell verbatim", "Do not normalize", "keep values from separate UI regions separate", "instead of guessing"} {
+		if !strings.Contains(defaultVisionPrompt, instruction) {
+			t.Fatalf("default vision prompt is missing %q", instruction)
+		}
+	}
+}
+
+func TestVisionRequestUsesHighImageDetail(t *testing.T) {
+	raw := makeVisionRequest("vision-a", defaultVisionPrompt, "读取截图", "data:image/png;base64,YQ==", 4000)
+	var request map[string]any
+	if err := json.Unmarshal(raw, &request); err != nil {
+		t.Fatal(err)
+	}
+	messages := request["messages"].([]any)
+	content := messages[0].(map[string]any)["content"].([]any)
+	image := content[1].(map[string]any)["image_url"].(map[string]any)
+	if image["detail"] != "high" {
+		t.Fatalf("image detail = %#v", image["detail"])
+	}
+}
+
 func TestTransformOpenAIRequestReplacesImageAndPreservesText(t *testing.T) {
 	raw := []byte(`{"model":"glm-5.2-vision-combo","messages":[{"role":"user","content":[{"type":"text","text":"what is this?"},{"type":"image_url","image_url":{"url":"https://example.test/a.png"}}]}]}`)
 	got, count, err := transformOpenAIRequest(raw, testRuntime(), func(a visualAsset, context string) (string, error) {
@@ -122,6 +166,8 @@ func TestNamedVisionChainOverridesAdvancedList(t *testing.T) {
 	cfg := defaultPluginConfig()
 	cfg.VisionPrimaryModel = "vision-a"
 	cfg.VisionBackupModel1 = "vision-b"
+	cfg.VisionBackupModel2 = ""
+	cfg.VisionBackupModel3 = ""
 	cfg.VisionContextLimit = 256000
 	cfg.VisionModels = []visionModel{{Model: "ignored-advanced", ContextLimit: 1}}
 	got, err := normalizeConfig(cfg)

@@ -111,7 +111,7 @@ func TestSingleFlightRunsExtractionOnce(t *testing.T) {
 func TestManagementPageContainsUnifiedControls(t *testing.T) {
 	runtime := testRuntime()
 	html := managementHTML(runtime)
-	for _, want := range []string{"视觉桥接 v0.4.3", "OpenAI Chat", "Claude Messages", "路由预览", "历史图片策略", "自动压缩长对话", "文本备用模型 1", "强制 low", "可取消识别超时", "取消确认等待", "vision_cancel_grace_seconds:n('vision_cancel_grace_seconds')", "缓存键包含图片与附近任务", "保存并重新加载插件"} {
+	for _, want := range []string{"视觉桥接 v0.4.4", "OpenAI Chat", "Claude Messages", "路由预览", "历史图片策略", "自动压缩长对话", "文本备用模型 1", "强制 low", "按实际截图的准确率和完成耗时排序", "可取消识别超时", "生产实测推荐 20 秒", "取消确认等待", "vision_cancel_grace_seconds:n('vision_cancel_grace_seconds')", "缓存键包含图片与附近任务", "保存并重新加载插件"} {
 		if !strings.Contains(html, want) {
 			t.Fatalf("missing %q", want)
 		}

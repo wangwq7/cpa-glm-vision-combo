@@ -7,3 +7,6 @@ management-preview*.html
 management-preview*.png
 management-settings*.png
 test-results/
+dist/
+__pycache__/
+*.pyc
