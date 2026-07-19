@@ -108,3 +108,42 @@ func BenchmarkTransformManyArchivedImages(b *testing.B) {
 		}
 	}
 }
+
+func BenchmarkPrepareFinalLargeToolHistory(b *testing.B) {
+	cfg := testRuntime()
+	defer cfg.cache.close()
+	cfg.AutoCompressionThresholdTokens = 720000
+	cfg.PrimaryContextBudgetTokens = 930000
+	cfg.AutoCompressionKeepRecentTurns = 8
+	items := make([]any, 0, 100)
+	items = append(items, map[string]any{"role": "system", "content": strings.Repeat("system rules ", 3000)})
+	for index := 0; index < 24; index++ {
+		id := fmt.Sprintf("call_%02d", index)
+		items = append(items,
+			map[string]any{"role": "user", "content": fmt.Sprintf("task %02d: inspect the repository", index)},
+			map[string]any{"role": "assistant", "tool_calls": []any{map[string]any{"id": id, "type": "function", "function": map[string]any{"name": "exec", "arguments": strings.Repeat("a", 6900)}}}},
+			map[string]any{"role": "tool", "tool_call_id": id, "content": strings.Repeat("t", 24900)},
+			map[string]any{"role": "assistant", "content": fmt.Sprintf("conclusion %02d: %s", index, strings.Repeat("c", 600))},
+		)
+	}
+	items = append(items, map[string]any{"role": "user", "content": "latest follow-up"})
+	raw, _ := json.Marshal(map[string]any{"model": "glm-5.2-vision-combo", "messages": items})
+	got, err := prepareFinalTextBody(raw, cfg, "", nil)
+	if err != nil {
+		b.Fatal(err)
+	}
+	if len(got) >= len(raw)/4 {
+		b.Fatalf("tool history did not shrink enough: before=%d after=%d", len(raw), len(got))
+	}
+	b.ReportAllocs()
+	b.SetBytes(int64(len(raw)))
+	b.ResetTimer()
+	for range b.N {
+		got, err := prepareFinalTextBody(raw, cfg, "", nil)
+		if err != nil || len(got) >= len(raw)/4 {
+			b.Fatalf("bytes=%d err=%v", len(got), err)
+		}
+	}
+	b.ReportMetric(float64(len(raw)), "before_bytes")
+	b.ReportMetric(float64(len(got)), "after_bytes")
+}

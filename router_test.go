@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -37,9 +38,31 @@ func TestDefaultConfigUsesBenchmarkedProductionProfile(t *testing.T) {
 }
 
 func TestDefaultVisionPromptRequiresVerbatimOCR(t *testing.T) {
-	for _, instruction := range []string{"Accuracy has priority over brevity", "timestamp", "table cell verbatim", "Do not normalize", "keep values from separate UI regions separate", "instead of guessing"} {
+	for _, instruction := range []string{"starts directly", "Do not add a SUMMARY section by default", "never repeat", "timestamps", "table cells verbatim", "Do not normalize", "keep values from separate UI regions separate", "instead of guessing", "concise elsewhere"} {
 		if !strings.Contains(defaultVisionPrompt, instruction) {
 			t.Fatalf("default vision prompt is missing %q", instruction)
+		}
+	}
+}
+
+func TestHistoricalImageReferenceDetectionIsExplicit(t *testing.T) {
+	tests := []struct {
+		text string
+		want int
+	}{
+		{text: "请重新查看上图", want: 1},
+		{text: "分析这张截图", want: 1},
+		{text: "compare the previous image with this result", want: 1},
+		{text: "比较这两张图片", want: 3},
+		{text: "review all screenshots", want: 3},
+		{text: "图片多了以后为什么会变慢", want: 0},
+		{text: "继续处理这个文件", want: 0},
+		{text: "document the image cache behavior", want: 0},
+		{text: "继续分析代码", want: 0},
+	}
+	for _, test := range tests {
+		if got := historicalImageRestoreCount(test.text, 3); got != test.want {
+			t.Fatalf("text=%q restore=%d, want %d", test.text, got, test.want)
 		}
 	}
 }
@@ -157,6 +180,44 @@ func TestCachedHistoricalImageIsCompactedWithoutVisionCall(t *testing.T) {
 	got, _, err := transformOpenAIRequest(raw, r, func(visualAsset, string) (string, error) { calls++; return "", nil })
 	if err != nil || calls != 0 || !strings.Contains(string(got), "历史图片附件已归档") || strings.Contains(string(got), "data:image") {
 		t.Fatalf("calls=%d err=%v body=%s", calls, err, got)
+	}
+}
+
+func TestGenericFileFollowUpDoesNotRestoreHistoricalImage(t *testing.T) {
+	r := testRuntime()
+	defer r.cache.close()
+	raw := []byte(`{"messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"data:image/png;base64,YQ=="}}]},{"role":"assistant","content":"看到了"},{"role":"user","content":"继续处理这个文件"}]}`)
+	calls := 0
+	got, count, err := transformOpenAIRequest(raw, r, func(visualAsset, string) (string, error) {
+		calls++
+		return "unexpected", nil
+	})
+	if err != nil || count != 1 || calls != 0 || !strings.Contains(string(got), "历史图片附件已归档") {
+		t.Fatalf("count=%d calls=%d err=%v body=%s", count, calls, err, got)
+	}
+}
+
+func TestSingularAndPluralHistoryReferencesRestoreExpectedImages(t *testing.T) {
+	rawTemplate := `{"messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"data:image/png;base64,YQ=="}}]},{"role":"assistant","content":"第一张"},{"role":"user","content":[{"type":"image_url","image_url":{"url":"data:image/png;base64,Yg=="}}]},{"role":"assistant","content":"第二张"},{"role":"user","content":%q}]}`
+	for _, test := range []struct {
+		text string
+		want int
+	}{
+		{text: "请重新查看上图", want: 1},
+		{text: "请比较这两张图片", want: 2},
+	} {
+		r := testRuntime()
+		r.HistoryRestoreMaxAttachments = 2
+		var calls atomic.Int32
+		raw := []byte(fmt.Sprintf(rawTemplate, test.text))
+		_, _, err := transformOpenAIRequest(raw, r, func(visualAsset, string) (string, error) {
+			calls.Add(1)
+			return "restored", nil
+		})
+		r.cache.close()
+		if err != nil || calls.Load() != int32(test.want) {
+			t.Fatalf("text=%q calls=%d err=%v, want %d", test.text, calls.Load(), err, test.want)
+		}
 	}
 }
 

@@ -15,7 +15,18 @@ type historySummarizerFunc func(string, runtimeConfig, string, *comboEvent) (str
 func estimateBodyTokens(body []byte) int { return (len(body) + 2) / 3 }
 
 func prepareFinalTextBody(raw []byte, cfg runtimeConfig, callbackID string, event *comboEvent) ([]byte, error) {
+	compactionStarted := time.Now()
+	compacted, toolPlan, err := compactOldToolTrajectories(raw, cfg.AutoCompressionKeepRecentTurns)
+	if err != nil {
+		return nil, err
+	}
+	if toolPlan.RemovedItems > 0 || toolPlan.RemovedBlocks > 0 {
+		detail := fmt.Sprintf("已归档较早且完整配对的工具轨迹：移除 %d 条完整消息/项目及 %d 个嵌套工具块；请求由约 %d token 降至 %d token，减少 %d 字节。用户文本、普通回答和最近 %d 条对话项目保持原文。", toolPlan.RemovedItems, toolPlan.RemovedBlocks, estimateBodyTokens(raw), estimateBodyTokens(compacted), toolPlan.savedBytes(), cfg.AutoCompressionKeepRecentTurns)
+		cfg.events.stage(event, "旧工具轨迹归档", "完成", "本地确定性处理", detail, compactionStarted)
+	}
+	raw = compacted
 	initialTokens := estimateBodyTokens(raw)
+	cfg.events.stage(event, "文本上下文预检", "完成", cfg.PrimaryModel, fmt.Sprintf("附件与旧工具轨迹处理后请求约 %d token；自动压缩阈值 %d，主模型工作预算 %d。", initialTokens, cfg.AutoCompressionThresholdTokens, cfg.PrimaryContextBudgetTokens), time.Now())
 	if initialTokens < cfg.AutoCompressionThresholdTokens {
 		if initialTokens > cfg.PrimaryContextBudgetTokens {
 			return nil, fmt.Errorf("conversation exceeds the primary working budget (%d tokens)", cfg.PrimaryContextBudgetTokens)

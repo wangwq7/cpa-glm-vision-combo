@@ -184,6 +184,28 @@ func TestProcessedImagesRemoveOnlyTheViewImageTool(t *testing.T) {
 	}
 }
 
+func TestPreparePrimaryBodyReportsHistoricalImagePlan(t *testing.T) {
+	runtime := testRuntime()
+	defer runtime.cache.close()
+	event := runtime.events.begin("combo", runtime.PrimaryModel, false)
+	raw := []byte(`{"model":"glm-5.2-vision-combo","messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"data:image/png;base64,YQ=="}}]},{"role":"assistant","content":"seen"},{"role":"user","content":"continue the code discussion"}]}`)
+	body, images, err := preparePrimaryBody(raw, "openai", runtime, "", event)
+	if err != nil || images != 1 || strings.Contains(string(body), "data:image") {
+		t.Fatalf("images=%d err=%v body=%s", images, err, body)
+	}
+	for _, item := range runtime.events.snapshot() {
+		if item.ID != event.ID {
+			continue
+		}
+		for _, stage := range item.Stages {
+			if stage.Name == "历史图片处理" && strings.Contains(stage.Detail, "1 张替换为固定短归档标记") && strings.Contains(stage.Detail, "未解码旧图") {
+				return
+			}
+		}
+	}
+	t.Fatal("historical image plan event was not recorded")
+}
+
 func TestTextOnlyRequestsKeepImageInspectionTools(t *testing.T) {
 	runtime := testRuntime()
 	raw := `{"model":"glm-5.2-vision-combo","messages":[{"role":"user","content":"inspect the repository"}],"tools":[{"type":"function","function":{"name":"view_image"}},{"type":"function","function":{"name":"exec"}}],"tool_choice":{"type":"function","function":{"name":"view_image"}}}`
@@ -244,7 +266,7 @@ func toolChoiceReferences(value any, name string) bool {
 func TestManagementPageContainsUnifiedControls(t *testing.T) {
 	runtime := testRuntime()
 	html := managementHTML(runtime)
-	for _, want := range []string{"视觉桥接 v0.4.7", "OpenAI Chat", "Claude Messages", "路由预览", "历史图片策略", "自动压缩长对话", "复用增量摘要检查点", "固定归档标记", "文本备用模型 1", "强制 low", "按实际截图的准确率和完成耗时排序", "可取消识别超时", "生产实测推荐 20 秒", "取消确认等待", "vision_cancel_grace_seconds:n('vision_cancel_grace_seconds')", "缓存键包含图片与附近任务", "保存并重新加载插件"} {
+	for _, want := range []string{"视觉桥接 v0.4.7", "OpenAI Chat", "Responses", "Claude Messages", "路由预览", "历史图片策略", "自动压缩长对话", "旧工具轨迹", "摘要检查点", "固定归档标记", "文本备用模型 1", "强制 low", "按实际截图的准确率和完成耗时排序", "可取消识别超时", "生产实测推荐 20 秒", "取消确认等待", "vision_cancel_grace_seconds:n('vision_cancel_grace_seconds')", "缓存键包含图片与附近任务", "保存并重新加载插件"} {
 		if !strings.Contains(html, want) {
 			t.Fatalf("missing %q", want)
 		}

@@ -133,6 +133,22 @@ func TestRepeatedLongHistoryReusesCheckpointWithoutSummarizingAgain(t *testing.T
 	assertEventStage(t, cfg.events, secondEvent.ID, "复用历史压缩检查点")
 }
 
+func TestTextContextPrecheckEventIsRecordedBelowCompressionThreshold(t *testing.T) {
+	var calls atomic.Int32
+	cfg := checkpointTestRuntime(&calls)
+	defer cfg.cache.close()
+	cfg.AutoCompressionThresholdTokens = 1000
+	event := cfg.events.begin("combo", "glm", false)
+	raw := longHistoryBody(2, 30)
+	if _, err := prepareFinalTextBody(raw, cfg, "", event); err != nil {
+		t.Fatal(err)
+	}
+	if calls.Load() != 0 {
+		t.Fatalf("summarizer calls=%d", calls.Load())
+	}
+	assertEventStage(t, cfg.events, event.ID, "文本上下文预检")
+}
+
 func TestSmallAppendedTurnReusesCheckpointWithoutSummarizing(t *testing.T) {
 	var calls atomic.Int32
 	cfg := checkpointTestRuntime(&calls)

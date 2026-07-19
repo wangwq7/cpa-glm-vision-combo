@@ -397,8 +397,17 @@ func preparePrimaryBody(raw []byte, protocol string, cfg runtimeConfig, callback
 	if len(raw) == 0 {
 		return nil, 0, fmt.Errorf("original %s request is missing", protocol)
 	}
-	body, images, err := transformRequest(raw, protocol, cfg, func(asset visualAsset, contextText string) (string, error) {
+	body, images, err := transformRequestWithPlan(raw, protocol, cfg, func(asset visualAsset, contextText string) (string, error) {
 		return describeImage(cfg, callbackID, asset, contextText, event)
+	}, func(plan visualTransformPlan) {
+		if plan.HistoricalImages == 0 {
+			return
+		}
+		detail := fmt.Sprintf("检测到 %d 张历史图片：%d 张替换为固定短归档标记，%d 张因本轮明确引用而恢复；当前轮图片 %d 张。", plan.HistoricalImages, plan.ArchivedImages, plan.RestoredImages, plan.CurrentImages)
+		if plan.RestoredImages == 0 {
+			detail += " 未解码旧图，也未调用视觉模型。"
+		}
+		cfg.events.stage(event, "历史图片处理", "完成", cfg.PrimaryModel, detail, time.Now())
 	})
 	if err != nil || images == 0 {
 		return body, images, err
