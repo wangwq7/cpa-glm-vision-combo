@@ -38,7 +38,7 @@ import (
 
 const pluginID = "glm-vision-combo"
 
-var pluginVersion = "0.4.6"
+var pluginVersion = "0.4.7"
 var configured atomic.Value
 var telemetry = newEventStore(100)
 

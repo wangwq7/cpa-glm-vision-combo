@@ -86,6 +86,16 @@ func TestTransformRespectsRemoteURLPolicy(t *testing.T) {
 	}
 }
 
+func TestOversizedBase64ValidationStopsAtConfiguredLimit(t *testing.T) {
+	r := testRuntime()
+	defer r.cache.close()
+	r.MaxImageDataBytes = 3
+	err := validateAsset("data:image/png;base64,"+strings.Repeat("YQ==", 100000), r)
+	if err == nil || !strings.Contains(err.Error(), "maximum") {
+		t.Fatalf("err=%v", err)
+	}
+}
+
 func TestVisionRequestAndResponse(t *testing.T) {
 	request := makeVisionRequest("vision", "prompt", "context", "data:image/png;base64,a", 100)
 	var decoded map[string]any

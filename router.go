@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/url"
 	"sort"
 	"strconv"
@@ -309,6 +310,13 @@ func transformRequest(raw []byte, protocol string, cfg runtimeConfig, describe f
 	if !isSupportedProtocol(protocol) {
 		return nil, 0, fmt.Errorf("unsupported request protocol %q", protocol)
 	}
+	mayContainMedia, valid := requestMayContainMedia(raw)
+	if !valid {
+		return nil, 0, fmt.Errorf("invalid %s request JSON", protocol)
+	}
+	if !mayContainMedia {
+		return raw, 0, nil
+	}
 	var root any
 	if err := json.Unmarshal(raw, &root); err != nil {
 		return nil, 0, fmt.Errorf("invalid %s request JSON: %w", protocol, err)
@@ -450,9 +458,11 @@ func transformRequest(raw []byte, protocol string, cfg runtimeConfig, describe f
 }
 
 func finishVisualTransform(root any, imageCount int) ([]byte, int, error) {
-	if _, residual := inspectVisualMedia(root); len(residual) > 0 {
+	remaining, residual := inspectVisualMedia(root)
+	if len(residual) > 0 {
 		return nil, imageCount, fmt.Errorf("media remained after preprocessing at %s: %s", strings.Join(residual[0].Path, "/"), residual[0].Reason)
-	} else if remaining := collectVisualAssets(root); len(remaining) > 0 {
+	}
+	if len(remaining) > 0 {
 		return nil, imageCount, fmt.Errorf("%d image attachment(s) remained after preprocessing", len(remaining))
 	}
 	resultBody, err := json.Marshal(root)
@@ -827,15 +837,24 @@ func validateAsset(raw string, cfg runtimeConfig) error {
 		payload := raw[comma+1:]
 		var size int
 		if strings.Contains(metadata, ";base64") {
-			decoded, err := base64.StdEncoding.DecodeString(payload)
+			decoder := base64.NewDecoder(base64.StdEncoding, strings.NewReader(payload))
+			decoded, err := io.Copy(io.Discard, io.LimitReader(decoder, int64(cfg.MaxImageDataBytes)+1))
 			if err != nil {
 				return fmt.Errorf("invalid base64 image data")
 			}
-			size = len(decoded)
-		} else if decoded, err := url.QueryUnescape(payload); err == nil {
-			size = len(decoded)
+			if decoded > int64(cfg.MaxImageDataBytes) {
+				return fmt.Errorf("image exceeds the maximum of %d bytes", cfg.MaxImageDataBytes)
+			}
+			if decoded > int64(^uint(0)>>1) {
+				return fmt.Errorf("image data is too large")
+			}
+			size = int(decoded)
 		} else {
-			return fmt.Errorf("invalid image data URL")
+			var err error
+			size, err = queryUnescapedSize(payload)
+			if err != nil {
+				return err
+			}
 		}
 		if size > cfg.MaxImageDataBytes {
 			return fmt.Errorf("image contains %d bytes; maximum is %d", size, cfg.MaxImageDataBytes)
@@ -853,6 +872,26 @@ func validateAsset(raw string, cfg runtimeConfig) error {
 		return fmt.Errorf("PDF attachments are not supported by the image bridge")
 	}
 	return nil
+}
+
+func queryUnescapedSize(payload string) (int, error) {
+	size := 0
+	for index := 0; index < len(payload); index++ {
+		if payload[index] != '%' {
+			size++
+			continue
+		}
+		if index+2 >= len(payload) || !isHex(payload[index+1]) || !isHex(payload[index+2]) {
+			return 0, fmt.Errorf("invalid image data URL")
+		}
+		size++
+		index += 2
+	}
+	return size, nil
+}
+
+func isHex(value byte) bool {
+	return value >= '0' && value <= '9' || value >= 'a' && value <= 'f' || value >= 'A' && value <= 'F'
 }
 
 func validateArchivedAssetMetadata(raw string, cfg runtimeConfig) error {
@@ -939,8 +978,16 @@ func visualCacheKey(cfg runtimeConfig, asset visualAsset, contextText string) st
 	for _, item := range cfg.VisionModels {
 		profile = append(profile, fmt.Sprintf("%s:%d", item.Model, item.MaxOutputTokens))
 	}
-	sum := sha256.Sum256([]byte("vision-v5\x00" + strings.Join(profile, "\x1f") + "\x00" + cfg.VisionPrompt + "\x00" + normalizedContext + "\x00" + asset.URL))
-	return hex.EncodeToString(sum[:])
+	hash := sha256.New()
+	_, _ = io.WriteString(hash, "vision-v5\x00")
+	_, _ = io.WriteString(hash, strings.Join(profile, "\x1f"))
+	_, _ = io.WriteString(hash, "\x00")
+	_, _ = io.WriteString(hash, cfg.VisionPrompt)
+	_, _ = io.WriteString(hash, "\x00")
+	_, _ = io.WriteString(hash, normalizedContext)
+	_, _ = io.WriteString(hash, "\x00")
+	_, _ = io.WriteString(hash, asset.URL)
+	return hex.EncodeToString(hash.Sum(nil))
 }
 
 func estimateTokens(text string) int { return (len([]rune(text)) + 2) / 3 }
