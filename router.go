@@ -439,6 +439,88 @@ func transformRequest(raw []byte, protocol string, cfg runtimeConfig, describe f
 	return resultBody, len(assets), err
 }
 
+func removeRedundantImageInspectionTools(raw []byte) ([]byte, bool, error) {
+	var root map[string]any
+	if err := json.Unmarshal(raw, &root); err != nil {
+		return nil, false, fmt.Errorf("cannot filter image inspection tools from invalid request JSON: %w", err)
+	}
+	removed := filterNamedToolList(root, "tools", "view_image")
+	if input, ok := root["input"].([]any); ok {
+		for _, item := range input {
+			obj, _ := item.(map[string]any)
+			if strings.EqualFold(strings.TrimSpace(stringValue(obj["type"])), "additional_tools") {
+				removed = filterNamedToolList(obj, "tools", "view_image") || removed
+			}
+		}
+	}
+	if cleanToolChoice(root, "view_image") {
+		removed = true
+	}
+	if !removed {
+		return raw, false, nil
+	}
+	encoded, err := json.Marshal(root)
+	return encoded, true, err
+}
+
+func filterNamedToolList(parent map[string]any, field, blockedName string) bool {
+	tools, ok := parent[field].([]any)
+	if !ok {
+		return false
+	}
+	filtered := make([]any, 0, len(tools))
+	removed := false
+	for _, tool := range tools {
+		if toolDefinitionName(tool) == blockedName {
+			removed = true
+			continue
+		}
+		filtered = append(filtered, tool)
+	}
+	if removed {
+		parent[field] = filtered
+	}
+	return removed
+}
+
+func toolDefinitionName(value any) string {
+	tool, _ := value.(map[string]any)
+	if name := strings.TrimSpace(stringValue(tool["name"])); name != "" {
+		return name
+	}
+	function, _ := tool["function"].(map[string]any)
+	return strings.TrimSpace(stringValue(function["name"]))
+}
+
+func cleanToolChoice(root map[string]any, blockedName string) bool {
+	choice, ok := root["tool_choice"]
+	if !ok {
+		return false
+	}
+	if name, ok := choice.(string); ok {
+		if strings.TrimSpace(name) == blockedName {
+			delete(root, "tool_choice")
+			return true
+		}
+		return false
+	}
+	choiceObject, ok := choice.(map[string]any)
+	if !ok {
+		return false
+	}
+	if toolDefinitionName(choiceObject) == blockedName {
+		delete(root, "tool_choice")
+		return true
+	}
+	if filterNamedToolList(choiceObject, "tools", blockedName) {
+		if tools, _ := choiceObject["tools"].([]any); len(tools) == 0 {
+			delete(root, "tool_choice")
+		}
+		return true
+	}
+	return false
+}
+
 func referencesAttachment(text string) bool {
 	lower := " " + strings.ToLower(text)
 	for _, marker := range attachmentReferenceRE {

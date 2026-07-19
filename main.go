@@ -38,7 +38,7 @@ import (
 
 const pluginID = "glm-vision-combo"
 
-var pluginVersion = "0.4.4"
+var pluginVersion = "0.4.5"
 var configured atomic.Value
 var telemetry = newEventStore(100)
 
@@ -397,9 +397,20 @@ func preparePrimaryBody(raw []byte, protocol string, cfg runtimeConfig, callback
 	if len(raw) == 0 {
 		return nil, 0, fmt.Errorf("original %s request is missing", protocol)
 	}
-	return transformRequest(raw, protocol, cfg, func(asset visualAsset, contextText string) (string, error) {
+	body, images, err := transformRequest(raw, protocol, cfg, func(asset visualAsset, contextText string) (string, error) {
 		return describeImage(cfg, callbackID, asset, contextText, event)
 	})
+	if err != nil || images == 0 {
+		return body, images, err
+	}
+	body, removed, err := removeRedundantImageInspectionTools(body)
+	if err != nil {
+		return nil, images, err
+	}
+	if removed {
+		cfg.events.stage(event, "屏蔽重复看图工具", "完成", cfg.PrimaryModel, "图片已转换为视觉记忆；已从本轮文本模型工具列表移除 view_image，其他工具保持不变。", time.Now())
+	}
+	return body, images, nil
 }
 func describeImage(cfg runtimeConfig, callbackID string, asset visualAsset, contextText string, event *comboEvent) (string, error) {
 	if err := validateAsset(asset.URL, cfg); err != nil {

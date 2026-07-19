@@ -108,10 +108,143 @@ func TestSingleFlightRunsExtractionOnce(t *testing.T) {
 	}
 }
 
+func TestProcessedImagesRemoveOnlyTheViewImageTool(t *testing.T) {
+	tests := []struct {
+		name     string
+		protocol string
+		raw      string
+	}{
+		{
+			name:     "openai chat",
+			protocol: "openai",
+			raw:      `{"model":"glm-5.2-vision-combo","messages":[{"role":"user","content":[{"type":"text","text":"inspect"},{"type":"image_url","image_url":{"url":"data:image/png;base64,YQ=="}}]}],"tools":[{"type":"function","function":{"name":"view_image"}},{"type":"function","function":{"name":"exec"}},{"type":"function","function":{"name":"image_gen__imagegen"}}],"tool_choice":{"type":"function","function":{"name":"view_image"}}}`,
+		},
+		{
+			name:     "claude messages",
+			protocol: "claude",
+			raw:      `{"model":"glm-5.2-vision-combo","messages":[{"role":"user","content":[{"type":"text","text":"inspect"},{"type":"image","source":{"type":"base64","media_type":"image/png","data":"YQ=="}}]}],"tools":[{"name":"view_image"},{"name":"exec"}],"tool_choice":{"type":"tool","name":"view_image"}}`,
+		},
+		{
+			name:     "openai responses",
+			protocol: "openai",
+			raw:      `{"model":"glm-5.2-vision-combo","input":[{"type":"additional_tools","role":"developer","tools":[{"type":"function","name":"view_image"},{"type":"function","name":"exec"}]},{"role":"user","content":[{"type":"input_text","text":"inspect"},{"type":"input_image","image_url":"data:image/png;base64,YQ=="}]}],"tools":[{"type":"function","name":"view_image"},{"type":"function","name":"exec"}],"tool_choice":{"type":"allowed_tools","mode":"auto","tools":[{"type":"function","name":"view_image"},{"type":"function","name":"exec"}]}}`,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			runtime := testRuntime()
+			var root any
+			if err := json.Unmarshal([]byte(test.raw), &root); err != nil {
+				t.Fatal(err)
+			}
+			asset := collectVisualAssets(root)[0]
+			context := trimToTokens(nearbyUserTask(root, asset), runtime.VisionInputTokenBudget)
+			runtime.cache.set(visualCacheKey(runtime, asset, context), "vision", "recognized image", time.Hour)
+			event := runtime.events.begin(runtime.ComboModel, runtime.PrimaryModel, false)
+			body, images, err := preparePrimaryBody([]byte(test.raw), test.protocol, runtime, "", event)
+			if err != nil || images != 1 {
+				t.Fatalf("images=%d err=%v", images, err)
+			}
+			var got map[string]any
+			if err := json.Unmarshal(body, &got); err != nil {
+				t.Fatal(err)
+			}
+			if toolChoiceReferences(got["tool_choice"], "view_image") {
+				t.Fatalf("tool_choice still references removed tool: %s", body)
+			}
+			assertToolListExcludes(t, got["tools"], "view_image")
+			assertToolListContains(t, got["tools"], "exec")
+			if test.name == "openai chat" {
+				assertToolListContains(t, got["tools"], "image_gen__imagegen")
+			}
+			if input, ok := got["input"].([]any); ok {
+				for _, item := range input {
+					obj, _ := item.(map[string]any)
+					if stringValue(obj["type"]) == "additional_tools" {
+						assertToolListExcludes(t, obj["tools"], "view_image")
+						assertToolListContains(t, obj["tools"], "exec")
+					}
+				}
+			}
+			foundStage := false
+			for _, stored := range runtime.events.snapshot() {
+				if stored.ID != event.ID {
+					continue
+				}
+				for _, stage := range stored.Stages {
+					if stage.Name == "屏蔽重复看图工具" {
+						foundStage = true
+					}
+				}
+			}
+			if !foundStage {
+				t.Fatal("missing tool filtering event")
+			}
+		})
+	}
+}
+
+func TestTextOnlyRequestsKeepImageInspectionTools(t *testing.T) {
+	runtime := testRuntime()
+	raw := `{"model":"glm-5.2-vision-combo","messages":[{"role":"user","content":"inspect the repository"}],"tools":[{"type":"function","function":{"name":"view_image"}},{"type":"function","function":{"name":"exec"}}],"tool_choice":{"type":"function","function":{"name":"view_image"}}}`
+	event := runtime.events.begin(runtime.ComboModel, runtime.PrimaryModel, false)
+	body, images, err := preparePrimaryBody([]byte(raw), "openai", runtime, "", event)
+	if err != nil || images != 0 {
+		t.Fatalf("images=%d err=%v", images, err)
+	}
+	var got map[string]any
+	if err := json.Unmarshal(body, &got); err != nil {
+		t.Fatal(err)
+	}
+	assertToolListContains(t, got["tools"], "view_image")
+	assertToolListContains(t, got["tools"], "exec")
+	if !toolChoiceReferences(got["tool_choice"], "view_image") {
+		t.Fatalf("text-only tool_choice changed unexpectedly: %s", body)
+	}
+}
+
+func assertToolListExcludes(t *testing.T, value any, name string) {
+	t.Helper()
+	tools, _ := value.([]any)
+	for _, tool := range tools {
+		if toolDefinitionName(tool) == name {
+			t.Fatalf("tool %q was not removed", name)
+		}
+	}
+}
+
+func assertToolListContains(t *testing.T, value any, name string) {
+	t.Helper()
+	tools, _ := value.([]any)
+	for _, tool := range tools {
+		if toolDefinitionName(tool) == name {
+			return
+		}
+	}
+	t.Fatalf("tool %q was removed unexpectedly", name)
+}
+
+func toolChoiceReferences(value any, name string) bool {
+	if direct, ok := value.(string); ok {
+		return strings.TrimSpace(direct) == name
+	}
+	choice, _ := value.(map[string]any)
+	if toolDefinitionName(choice) == name {
+		return true
+	}
+	tools, _ := choice["tools"].([]any)
+	for _, tool := range tools {
+		if toolDefinitionName(tool) == name {
+			return true
+		}
+	}
+	return false
+}
+
 func TestManagementPageContainsUnifiedControls(t *testing.T) {
 	runtime := testRuntime()
 	html := managementHTML(runtime)
-	for _, want := range []string{"视觉桥接 v0.4.4", "OpenAI Chat", "Claude Messages", "路由预览", "历史图片策略", "自动压缩长对话", "文本备用模型 1", "强制 low", "按实际截图的准确率和完成耗时排序", "可取消识别超时", "生产实测推荐 20 秒", "取消确认等待", "vision_cancel_grace_seconds:n('vision_cancel_grace_seconds')", "缓存键包含图片与附近任务", "保存并重新加载插件"} {
+	for _, want := range []string{"视觉桥接 v0.4.5", "OpenAI Chat", "Claude Messages", "路由预览", "历史图片策略", "自动压缩长对话", "文本备用模型 1", "强制 low", "按实际截图的准确率和完成耗时排序", "可取消识别超时", "生产实测推荐 20 秒", "取消确认等待", "vision_cancel_grace_seconds:n('vision_cancel_grace_seconds')", "缓存键包含图片与附近任务", "保存并重新加载插件"} {
 		if !strings.Contains(html, want) {
 			t.Fatalf("missing %q", want)
 		}
