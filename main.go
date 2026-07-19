@@ -38,7 +38,7 @@ import (
 
 const pluginID = "glm-vision-combo"
 
-var pluginVersion = "0.4.5"
+var pluginVersion = "0.4.6"
 var configured atomic.Value
 var telemetry = newEventStore(100)
 
@@ -242,12 +242,12 @@ func metadata() pluginapi.Metadata {
 		{Name: "max_image_data_bytes", Type: pluginapi.ConfigFieldTypeInteger, Description: "data URL 图片解码后的真实最大字节数。"},
 		{Name: "allow_remote_image_urls", Type: pluginapi.ConfigFieldTypeBoolean, Description: "是否允许读取 http/https 图片 URL。"},
 		{Name: "history_attachment_mode", Type: pluginapi.ConfigFieldTypeEnum, EnumValues: []string{"onDemand", "retain"}, Description: "历史图片按需恢复或完整保留。"},
-		{Name: "history_attachment_compact_chars", Type: pluginapi.ConfigFieldTypeInteger, Description: "无关轮中的历史图片短摘要字符数。"},
+		{Name: "history_attachment_compact_chars", Type: pluginapi.ConfigFieldTypeInteger, Description: "无关轮中的历史图片归档标记最大字符数。"},
 		{Name: "history_attachment_restore_max_attachments", Type: pluginapi.ConfigFieldTypeInteger, Description: "明确引用图片时最多恢复的历史图片数。"},
-		{Name: "auto_compression_enabled", Type: pluginapi.ConfigFieldTypeBoolean, Description: "达到阈值后自动压缩较早对话。"},
+		{Name: "auto_compression_enabled", Type: pluginapi.ConfigFieldTypeBoolean, Description: "达到阈值后建立可复用的历史摘要检查点。"},
 		{Name: "auto_compression_threshold_tokens", Type: pluginapi.ConfigFieldTypeInteger, Description: "自动压缩触发阈值。"},
 		{Name: "auto_compression_target_tokens", Type: pluginapi.ConfigFieldTypeInteger, Description: "历史摘要目标 token。"},
-		{Name: "auto_compression_keep_recent_turns", Type: pluginapi.ConfigFieldTypeInteger, Description: "压缩时保留原文的最近轮数。"},
+		{Name: "auto_compression_keep_recent_turns", Type: pluginapi.ConfigFieldTypeInteger, Description: "创建或更新检查点时优先保留原文的最近轮数。"},
 		{Name: "auto_compression_model", Type: pluginapi.ConfigFieldTypeString, Description: "压缩模型；留空使用首选文本模型。"},
 	}}
 }
@@ -413,9 +413,7 @@ func preparePrimaryBody(raw []byte, protocol string, cfg runtimeConfig, callback
 	return body, images, nil
 }
 func describeImage(cfg runtimeConfig, callbackID string, asset visualAsset, contextText string, event *comboEvent) (string, error) {
-	if err := validateAsset(asset.URL, cfg); err != nil {
-		return "", err
-	}
+	// transformRequest validates every selected image before any visual call.
 	key := visualCacheKey(cfg, asset, contextText)
 	if key != "" {
 		if cached, ok := cfg.cache.get(key); ok {

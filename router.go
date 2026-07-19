@@ -73,8 +73,9 @@ type pluginConfig struct {
 
 type runtimeConfig struct {
 	pluginConfig
-	cache  *memoCache
-	events *eventStore
+	cache             *memoCache
+	events            *eventStore
+	historySummarizer historySummarizerFunc
 }
 
 func defaultPluginConfig() pluginConfig {
@@ -319,9 +320,6 @@ func transformRequest(raw []byte, protocol string, cfg runtimeConfig, describe f
 	if len(assets) == 0 {
 		return raw, 0, nil
 	}
-	for index := range assets {
-		assets[index].Context = trimToTokens(nearbyUserTask(root, assets[index]), cfg.VisionInputTokenBudget)
-	}
 	latestIndex, latestText := latestUserTurn(root)
 	for _, asset := range assets {
 		if asset.ItemIndex > latestIndex {
@@ -362,19 +360,24 @@ func transformRequest(raw []byte, protocol string, cfg runtimeConfig, describe f
 			full[asset.ID] = true
 		}
 	}
+	for index := range assets {
+		if full[assets[index].ID] {
+			assets[index].Context = trimToTokens(nearbyUserTask(root, assets[index]), cfg.VisionInputTokenBudget)
+		}
+	}
 
 	descriptions := make(map[string]string, len(assets))
+	archived := make([]visualAsset, 0, len(historical))
 	for _, asset := range assets {
-		if full[asset.ID] {
-			continue
+		if !full[asset.ID] {
+			archived = append(archived, asset)
 		}
-		if key := visualCacheKey(cfg, asset, asset.Context); key != "" {
-			if cached, ok := cfg.cache.get(key); ok {
-				descriptions[asset.ID] = compactVisualMemory(cached, cfg.HistoryAttachmentCompactChars)
-				continue
-			}
+	}
+	if len(archived) > 0 {
+		descriptions[archived[0].ID] = archivedVisualMarker(cfg.HistoryAttachmentCompactChars)
+		for _, asset := range archived[1:] {
+			descriptions[asset.ID] = "[旧图已归档]"
 		}
-		descriptions[asset.ID] = "[历史图片附件已归档；当前问题未明确引用该图片，因此未恢复完整识别文本。]"
 	}
 
 	toResolve := make([]visualAsset, 0)
@@ -383,13 +386,26 @@ func transformRequest(raw []byte, protocol string, cfg runtimeConfig, describe f
 			toResolve = append(toResolve, asset)
 		}
 	}
-	// Validate every attachment before starting any upstream call. A malformed
-	// or oversized image must reject the whole request without partially
-	// spending the visual chain on earlier images.
-	for _, asset := range assets {
+	// Validate every image that will reach the visual chain before starting any
+	// upstream call. Archived history is represented by metadata only, so it is
+	// never base64-decoded or content-hashed on unrelated text turns.
+	for _, asset := range toResolve {
 		if err := validateAsset(asset.URL, cfg); err != nil {
 			return nil, len(assets), err
 		}
+	}
+	for _, asset := range archived {
+		if err := validateArchivedAssetMetadata(asset.URL, cfg); err != nil {
+			return nil, len(assets), err
+		}
+	}
+	if len(toResolve) == 0 {
+		for _, asset := range assets {
+			if !replaceAsset(root, asset.Path, descriptions[asset.ID]) {
+				return nil, len(assets), fmt.Errorf("failed to replace media at %s", strings.Join(asset.Path, "/"))
+			}
+		}
+		return finishVisualTransform(root, len(assets))
 	}
 	workers := minInt(cfg.MaxConcurrentExtractions, len(toResolve))
 	if workers < 1 {
@@ -430,13 +446,17 @@ func transformRequest(raw []byte, protocol string, cfg runtimeConfig, describe f
 			return nil, len(assets), fmt.Errorf("failed to replace media at %s", strings.Join(asset.Path, "/"))
 		}
 	}
+	return finishVisualTransform(root, len(assets))
+}
+
+func finishVisualTransform(root any, imageCount int) ([]byte, int, error) {
 	if _, residual := inspectVisualMedia(root); len(residual) > 0 {
-		return nil, len(assets), fmt.Errorf("media remained after preprocessing at %s: %s", strings.Join(residual[0].Path, "/"), residual[0].Reason)
+		return nil, imageCount, fmt.Errorf("media remained after preprocessing at %s: %s", strings.Join(residual[0].Path, "/"), residual[0].Reason)
 	} else if remaining := collectVisualAssets(root); len(remaining) > 0 {
-		return nil, len(assets), fmt.Errorf("%d image attachment(s) remained after preprocessing", len(remaining))
+		return nil, imageCount, fmt.Errorf("%d image attachment(s) remained after preprocessing", len(remaining))
 	}
 	resultBody, err := json.Marshal(root)
-	return resultBody, len(assets), err
+	return resultBody, imageCount, err
 }
 
 func removeRedundantImageInspectionTools(raw []byte) ([]byte, bool, error) {
@@ -547,6 +567,15 @@ func compactVisualMemory(description string, maxChars int) string {
 		normalized = strings.TrimSpace(string(runes[:maxChars])) + "…"
 	}
 	return "\n\n[历史图片附件已归档；完整识别文本仅在用户明确引用图片时恢复。摘要（untrusted）：" + normalized + "]\n"
+}
+
+func archivedVisualMarker(maxChars int) string {
+	detail := "[历史图片附件已归档；当前问题未明确引用图片，因此旧图未解码、未重新识别。需要重新查看时请明确提到图片、截图或附件。]"
+	runes := []rune(detail)
+	if maxChars > 0 && len(runes) > maxChars {
+		return string(runes[:maxChars-1]) + "…"
+	}
+	return detail
 }
 
 func collectVisualAssets(root any) []visualAsset {
@@ -822,6 +851,36 @@ func validateAsset(raw string, cfg runtimeConfig) error {
 	}
 	if strings.HasSuffix(strings.ToLower(parsed.Path), ".pdf") {
 		return fmt.Errorf("PDF attachments are not supported by the image bridge")
+	}
+	return nil
+}
+
+func validateArchivedAssetMetadata(raw string, cfg runtimeConfig) error {
+	raw = strings.TrimSpace(raw)
+	if !strings.HasPrefix(raw, "data:") {
+		if !cfg.AllowRemoteImageURLs {
+			return fmt.Errorf("remote image URLs are disabled")
+		}
+		parsed, err := url.Parse(raw)
+		if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Host == "" {
+			return fmt.Errorf("unsupported image URL")
+		}
+		if strings.HasSuffix(strings.ToLower(parsed.Path), ".pdf") {
+			return fmt.Errorf("PDF attachments are not supported by the image bridge")
+		}
+		return nil
+	}
+	comma := strings.IndexByte(raw, ',')
+	if comma < 0 {
+		return fmt.Errorf("invalid image data URL")
+	}
+	metadata := strings.ToLower(raw[5:comma])
+	mediaType := strings.TrimSpace(strings.SplitN(metadata, ";", 2)[0])
+	if mediaType == "application/pdf" {
+		return fmt.Errorf("PDF attachments are not supported by the image bridge")
+	}
+	if !strings.HasPrefix(mediaType, "image/") {
+		return fmt.Errorf("unsupported image data media type %q", mediaType)
 	}
 	return nil
 }

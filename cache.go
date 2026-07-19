@@ -89,6 +89,40 @@ func (m *memoCache) get(k string) (string, bool) {
 	return v.Value, true
 }
 
+// getLast returns the newest matching prefix key with one cache lock. Callers
+// provide keys from shortest to longest prefix.
+func (m *memoCache) getLast(keys []string) (string, int, bool) {
+	if m == nil || len(keys) == 0 {
+		return "", -1, false
+	}
+	now := time.Now()
+	removedExpired := false
+	m.mu.Lock()
+	for index := len(keys) - 1; index >= 0; index-- {
+		record, ok := m.values[keys[index]]
+		if !ok {
+			continue
+		}
+		if now.After(record.Expires) {
+			delete(m.values, keys[index])
+			removedExpired = true
+			continue
+		}
+		record.LastAccess = now
+		m.values[keys[index]] = record
+		m.mu.Unlock()
+		if removedExpired {
+			m.markDirty()
+		}
+		return record.Value, index, true
+	}
+	m.mu.Unlock()
+	if removedExpired {
+		m.markDirty()
+	}
+	return "", -1, false
+}
+
 func (m *memoCache) set(k, kind, value string, ttl time.Duration) {
 	if m == nil || k == "" || value == "" {
 		return

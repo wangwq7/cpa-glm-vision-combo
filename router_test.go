@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -146,6 +147,79 @@ func TestCachedHistoricalImageIsCompactedWithoutVisionCall(t *testing.T) {
 	got, _, err := transformOpenAIRequest(raw, r, func(visualAsset, string) (string, error) { calls++; return "", nil })
 	if err != nil || calls != 0 || !strings.Contains(string(got), "历史图片附件已归档") || strings.Contains(string(got), "data:image") {
 		t.Fatalf("calls=%d err=%v body=%s", calls, err, got)
+	}
+}
+
+func TestManyUnreferencedHistoricalImagesSkipDecodeAndStayCompact(t *testing.T) {
+	r := testRuntime()
+	defer r.cache.close()
+	items := make([]any, 0, 81)
+	for index := 0; index < 40; index++ {
+		image := map[string]any{
+			"role": "user",
+			"content": []any{map[string]any{
+				"type":      "image_url",
+				"image_url": map[string]any{"url": fmt.Sprintf("data:image/png;base64,not-valid-%d", index)},
+			}},
+		}
+		items = append(items,
+			image,
+			map[string]any{"role": "assistant", "content": "seen"},
+		)
+	}
+	items = append(items, map[string]any{"role": "user", "content": "continue discussing the code"})
+	raw, _ := json.Marshal(map[string]any{"messages": items})
+	calls := 0
+	got, count, err := transformOpenAIRequest(raw, r, func(visualAsset, string) (string, error) {
+		calls++
+		return "unexpected", nil
+	})
+	if err != nil || count != 40 || calls != 0 {
+		t.Fatalf("count=%d calls=%d err=%v", count, calls, err)
+	}
+	text := string(got)
+	if strings.Count(text, "历史图片附件已归档") != 1 || strings.Contains(text, "not-valid-") || len(got) > 8000 {
+		t.Fatalf("historical image output was not bounded: bytes=%d body=%s", len(got), got)
+	}
+}
+
+func TestReferencedHistoricalImageIsStillStrictlyValidated(t *testing.T) {
+	r := testRuntime()
+	defer r.cache.close()
+	raw := []byte(`{"messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"data:image/png;base64,not-valid"}}]},{"role":"assistant","content":"seen"},{"role":"user","content":"请重新查看上图"}]}`)
+	calls := 0
+	_, _, err := transformOpenAIRequest(raw, r, func(visualAsset, string) (string, error) {
+		calls++
+		return "unexpected", nil
+	})
+	if err == nil || !strings.Contains(err.Error(), "invalid base64") || calls != 0 {
+		t.Fatalf("calls=%d err=%v", calls, err)
+	}
+}
+
+func TestHistoricalImageBlockWithPDFMediaTypeStillFailsClosed(t *testing.T) {
+	r := testRuntime()
+	defer r.cache.close()
+	raw := []byte(`{"messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"data:application/pdf;base64,JVBERi0="}}]},{"role":"assistant","content":"seen"},{"role":"user","content":"continue the code discussion"}]}`)
+	calls := 0
+	_, _, err := transformOpenAIRequest(raw, r, func(visualAsset, string) (string, error) {
+		calls++
+		return "unexpected", nil
+	})
+	if err == nil || !strings.Contains(err.Error(), "PDF") || calls != 0 {
+		t.Fatalf("calls=%d err=%v", calls, err)
+	}
+}
+
+func TestHistoricalRemotePDFImageURLStillFailsClosed(t *testing.T) {
+	r := testRuntime()
+	defer r.cache.close()
+	raw := []byte(`{"messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"https://example.test/archive.pdf"}}]},{"role":"assistant","content":"seen"},{"role":"user","content":"continue the code discussion"}]}`)
+	_, _, err := transformOpenAIRequest(raw, r, func(visualAsset, string) (string, error) {
+		return "unexpected", nil
+	})
+	if err == nil || !strings.Contains(err.Error(), "PDF") {
+		t.Fatalf("err=%v", err)
 	}
 }
 
