@@ -30,6 +30,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 	"unsafe"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginabi"
@@ -482,21 +483,89 @@ func executeStream(raw []byte) ([]byte, error) {
 	return okEnvelope(map[string]any{"headers": http.Header{"Content-Type": []string{"text/event-stream"}}})
 }
 
-func prepareTextHostBody(raw []byte, protocol string, cfg runtimeConfig, callbackID string, event *comboEvent) ([]byte, error) {
-	body, normalized, err := normalizeResponsesStringInput(raw, protocol)
-	if err != nil {
-		return nil, err
-	}
-	if normalized {
-		cfg.events.stage(event, "规范化 Responses 输入", "完成", cfg.PrimaryModel, "字符串 input 已转换为等价的标准 user message 数组；其他请求参数保持不变。", time.Now())
-	}
-	return prepareFinalTextBody(body, cfg, callbackID, event)
+func prepareTextHostBody(raw []byte, _ string, cfg runtimeConfig, callbackID string, event *comboEvent) ([]byte, error) {
+	return prepareFinalTextBody(raw, cfg, callbackID, event)
 }
 
 func normalizeResponsesStringInput(raw []byte, protocol string) ([]byte, bool, error) {
+	body, changed, _, err := normalizeResponsesStringInputWithMedia(raw, protocol)
+	return body, changed, err
+}
+
+func normalizeResponsesStringInputWithMedia(raw []byte, protocol string) ([]byte, bool, bool, error) {
 	if normalizeProtocol(protocol) != "openai-response" {
-		return raw, false, nil
+		return raw, false, false, nil
 	}
+	scanner := mediaJSONScanner{
+		raw:                  raw,
+		continueAfterMedia:   true,
+		captureTopLevelInput: true,
+	}
+	scanner.skipSpace()
+	if scanner.pos >= len(raw) {
+		return nil, false, false, fmt.Errorf("cannot normalize invalid openai-response request JSON")
+	}
+	rootType := raw[scanner.pos]
+	_, valid := scanner.scanValue(0)
+	scanner.skipSpace()
+	if !valid || scanner.pos != len(raw) {
+		return nil, false, false, fmt.Errorf("cannot normalize invalid openai-response request JSON")
+	}
+	if rootType == 'n' {
+		return raw, false, scanner.mediaFound, nil
+	}
+	if rootType != '{' {
+		return nil, false, false, fmt.Errorf("cannot normalize openai-response request: top-level JSON value must be an object")
+	}
+	if scanner.topLevelInputCount == 0 {
+		return raw, false, scanner.mediaFound, nil
+	}
+	if scanner.topLevelInputCount > 1 {
+		return normalizeResponsesStringInputLegacyWithMedia(raw, scanner.mediaFound)
+	}
+	input := scanner.topLevelInput
+	if input.start >= input.end || raw[input.start] != '"' {
+		return raw, false, scanner.mediaFound, nil
+	}
+	if !utf8.Valid(raw) {
+		return normalizeResponsesStringInputLegacyWithMedia(raw, scanner.mediaFound)
+	}
+	var text string
+	if err := json.Unmarshal(raw[input.start:input.end], &text); err != nil {
+		return nil, false, false, fmt.Errorf("cannot decode openai-response string input: %w", err)
+	}
+	encodedText, err := json.Marshal(text)
+	if err != nil {
+		return nil, false, false, fmt.Errorf("cannot encode openai-response string input: %w", err)
+	}
+
+	const replacementPrefix = `[{"type":"message","role":"user","content":[{"type":"input_text","text":`
+	const replacementSuffix = `}]}]`
+	body := make([]byte, 0, len(raw)+len(replacementPrefix)+len(replacementSuffix)+len(encodedText)-(input.end-input.start))
+	body = append(body, raw[:input.start]...)
+	body = append(body, replacementPrefix...)
+	body = append(body, encodedText...)
+	body = append(body, replacementSuffix...)
+	body = append(body, raw[input.end:]...)
+	return body, true, scanner.mediaFound, nil
+}
+
+func normalizeResponsesStringInputLegacyWithMedia(raw []byte, unchangedMedia bool) ([]byte, bool, bool, error) {
+	body, changed, err := normalizeResponsesStringInputLegacy(raw)
+	if err != nil {
+		return nil, false, false, err
+	}
+	if !changed {
+		return body, false, unchangedMedia, nil
+	}
+	media, valid := requestMayContainMedia(body)
+	if !valid {
+		return nil, false, false, fmt.Errorf("cannot validate normalized openai-response request JSON")
+	}
+	return body, true, media, nil
+}
+
+func normalizeResponsesStringInputLegacy(raw []byte) ([]byte, bool, error) {
 	var root map[string]json.RawMessage
 	if err := json.Unmarshal(raw, &root); err != nil {
 		return nil, false, fmt.Errorf("cannot normalize invalid openai-response request JSON: %w", err)
@@ -532,7 +601,19 @@ func preparePrimaryBody(raw []byte, protocol string, cfg runtimeConfig, callback
 	if len(raw) == 0 {
 		return nil, 0, fmt.Errorf("original %s request is missing", protocol)
 	}
-	body, images, err := transformRequestWithPlan(raw, protocol, cfg, func(asset visualAsset, contextText string) (string, error) {
+	var mayContainMedia *bool
+	if normalizeProtocol(protocol) == "openai-response" {
+		body, normalized, media, err := normalizeResponsesStringInputWithMedia(raw, protocol)
+		if err != nil {
+			return nil, 0, err
+		}
+		raw = body
+		mayContainMedia = &media
+		if normalized {
+			cfg.events.stage(event, "规范化 Responses 输入", "完成", cfg.PrimaryModel, "字符串 input 已转换为等价的标准 user message 数组；其他请求参数保持不变。", time.Now())
+		}
+	}
+	body, images, err := transformRequestWithPlanAndMediaHint(raw, protocol, cfg, mayContainMedia, func(asset visualAsset, contextText string) (string, error) {
 		return describeImage(cfg, callbackID, asset, contextText, event)
 	}, func(plan visualTransformPlan) {
 		if plan.HistoricalImages == 0 {

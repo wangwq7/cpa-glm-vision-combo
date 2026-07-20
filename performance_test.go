@@ -34,6 +34,101 @@ func BenchmarkTransformPureTextLargeHistory(b *testing.B) {
 	}
 }
 
+func BenchmarkNormalizeResponsesStringInput(b *testing.B) {
+	largeArrayRequest, _ := json.Marshal(map[string]any{
+		"model":        "glm-5.2-vision-combo",
+		"instructions": strings.Repeat("system rules ", 8192),
+		"input": []any{map[string]any{
+			"role": "user",
+			"content": []any{map[string]any{
+				"type": "input_text",
+				"text": strings.Repeat("history ", 262144),
+			}},
+		}},
+		"stream": true,
+	})
+	stringRequest, _ := json.Marshal(map[string]any{
+		"model":        "glm-5.2-vision-combo",
+		"instructions": strings.Repeat("system rules ", 8192),
+		"input":        "latest question",
+		"stream":       false,
+	})
+	requests := []struct {
+		name    string
+		raw     []byte
+		changed bool
+	}{
+		{name: "large-array", raw: largeArrayRequest, changed: false},
+		{name: "string", raw: stringRequest, changed: true},
+	}
+	implementations := []struct {
+		name string
+		run  func([]byte) ([]byte, bool, error)
+	}{
+		{name: "optimized", run: func(raw []byte) ([]byte, bool, error) {
+			return normalizeResponsesStringInput(raw, "openai-response")
+		}},
+		{name: "legacy", run: normalizeResponsesStringInputLegacy},
+	}
+	for _, implementation := range implementations {
+		for _, request := range requests {
+			b.Run(implementation.name+"/"+request.name, func(b *testing.B) {
+				b.ReportAllocs()
+				b.SetBytes(int64(len(request.raw)))
+				for range b.N {
+					got, changed, err := implementation.run(request.raw)
+					if err != nil || changed != request.changed {
+						b.Fatalf("changed=%v bytes=%d err=%v", changed, len(got), err)
+					}
+				}
+			})
+		}
+	}
+}
+
+func BenchmarkPrepareResponsesLargeHistory(b *testing.B) {
+	cfg := testRuntime()
+	defer cfg.cache.close()
+	raw, _ := json.Marshal(map[string]any{
+		"model":        "glm-5.2-vision-combo",
+		"instructions": strings.Repeat("system rules ", 8192),
+		"input": []any{map[string]any{
+			"role": "user",
+			"content": []any{map[string]any{
+				"type": "input_text",
+				"text": strings.Repeat("history ", 262144),
+			}},
+		}},
+		"stream": true,
+	})
+	b.Run("optimized", func(b *testing.B) {
+		b.ReportAllocs()
+		b.SetBytes(int64(len(raw)))
+		for range b.N {
+			got, images, err := preparePrimaryBody(raw, "openai-response", cfg, "", nil)
+			if err != nil || images != 0 || len(got) != len(raw) {
+				b.Fatalf("bytes=%d images=%d err=%v", len(got), images, err)
+			}
+		}
+	})
+	b.Run("legacy", func(b *testing.B) {
+		b.ReportAllocs()
+		b.SetBytes(int64(len(raw)))
+		for range b.N {
+			body, images, err := transformRequestWithPlan(raw, "openai-response", cfg, func(visualAsset, string) (string, error) {
+				b.Fatal("pure text legacy benchmark called vision")
+				return "", nil
+			}, nil)
+			if err == nil {
+				body, _, err = normalizeResponsesStringInputLegacy(body)
+			}
+			if err != nil || images != 0 || len(body) != len(raw) {
+				b.Fatalf("bytes=%d images=%d err=%v", len(body), images, err)
+			}
+		}
+	})
+}
+
 func BenchmarkPrepareFinalCheckpointReuse(b *testing.B) {
 	var calls atomic.Int32
 	cfg := testRuntime()

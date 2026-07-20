@@ -337,13 +337,23 @@ func transformRequest(raw []byte, protocol string, cfg runtimeConfig, describe f
 }
 
 func transformRequestWithPlan(raw []byte, protocol string, cfg runtimeConfig, describe func(visualAsset, string) (string, error), reportPlan func(visualTransformPlan)) ([]byte, int, error) {
+	return transformRequestWithPlanAndMediaHint(raw, protocol, cfg, nil, describe, reportPlan)
+}
+
+func transformRequestWithPlanAndMediaHint(raw []byte, protocol string, cfg runtimeConfig, mediaHint *bool, describe func(visualAsset, string) (string, error), reportPlan func(visualTransformPlan)) ([]byte, int, error) {
 	protocol = normalizeProtocol(protocol)
 	if !isSupportedProtocol(protocol) {
 		return nil, 0, fmt.Errorf("unsupported request protocol %q", protocol)
 	}
-	mayContainMedia, valid := requestMayContainMedia(raw)
-	if !valid {
-		return nil, 0, fmt.Errorf("invalid %s request JSON", protocol)
+	mayContainMedia := false
+	if mediaHint != nil {
+		mayContainMedia = *mediaHint
+	} else {
+		var valid bool
+		mayContainMedia, valid = requestMayContainMedia(raw)
+		if !valid {
+			return nil, 0, fmt.Errorf("invalid %s request JSON", protocol)
+		}
 	}
 	if !mayContainMedia {
 		return raw, 0, nil

@@ -20,8 +20,18 @@ func requestMayContainMedia(raw []byte) (bool, bool) {
 }
 
 type mediaJSONScanner struct {
-	raw []byte
-	pos int
+	raw                  []byte
+	pos                  int
+	continueAfterMedia   bool
+	mediaFound           bool
+	captureTopLevelInput bool
+	topLevelInput        jsonValueSpan
+	topLevelInputCount   int
+}
+
+type jsonValueSpan struct {
+	start int
+	end   int
 }
 
 func (s *mediaJSONScanner) scanValue(depth int) (bool, bool) {
@@ -66,18 +76,34 @@ func (s *mediaJSONScanner) scanObject(depth int) (bool, bool) {
 			return false, false
 		}
 		s.skipSpace()
+		valueStart := s.pos
 		if (key == "type" || key == "media_type") && s.pos < len(s.raw) && s.raw[s.pos] == '"' {
 			value, valid := s.readShortString(256)
 			if !valid {
 				return false, false
 			}
 			if mediaDiscriminator(key, strings.ToLower(strings.TrimSpace(value))) {
-				return true, true
+				s.mediaFound = true
+				if !s.continueAfterMedia {
+					return true, true
+				}
 			}
 		} else {
 			media, valid := s.scanValue(depth)
-			if media || !valid {
-				return media, valid
+			if !valid {
+				return false, false
+			}
+			if media {
+				s.mediaFound = true
+				if !s.continueAfterMedia {
+					return true, true
+				}
+			}
+		}
+		if s.captureTopLevelInput && depth == 1 && key == "input" {
+			s.topLevelInputCount++
+			if s.topLevelInputCount == 1 {
+				s.topLevelInput = jsonValueSpan{start: valueStart, end: s.pos}
 			}
 		}
 		s.skipSpace()
@@ -123,10 +149,8 @@ func (s *mediaJSONScanner) readKey() (string, bool) {
 	raw := s.raw[start+1 : s.pos-1]
 	if !bytes.ContainsRune(raw, '\\') {
 		switch string(raw) {
-		case "type":
-			return "type", true
-		case "media_type":
-			return "media_type", true
+		case "type", "media_type", "input":
+			return string(raw), true
 		default:
 			return "", true
 		}
@@ -138,7 +162,7 @@ func (s *mediaJSONScanner) readKey() (string, bool) {
 	if err != nil {
 		return "", false
 	}
-	if decoded == "type" || decoded == "media_type" {
+	if decoded == "type" || decoded == "media_type" || decoded == "input" {
 		return decoded, true
 	}
 	return "", true
