@@ -20,6 +20,37 @@ func TestPluginRegistersOpenAIAndClaudeProtocols(t *testing.T) {
 	}
 }
 
+func TestManagementMetadataMatchesCurrentParameters(t *testing.T) {
+	fields := make(map[string]pluginapi.ConfigField)
+	for _, field := range metadata().ConfigFields {
+		fields[field.Name] = field
+	}
+	for _, name := range []string{"vision_primary_model", "vision_input_token_budget", "vision_timeout_seconds", "vision_cancel_grace_seconds", "auto_compression_target_tokens"} {
+		if _, ok := fields[name]; !ok {
+			t.Fatalf("management metadata is missing %q", name)
+		}
+	}
+	for _, name := range []string{"vision_models", "vision_output_tokens", "max_tokens", "max_output_tokens"} {
+		if _, ok := fields[name]; ok {
+			t.Fatalf("management metadata still exposes %q", name)
+		}
+	}
+	checks := map[string][]string{
+		"vision_primary_model":           {"固定 low", "不设置输出 token 上限"},
+		"vision_input_token_budget":      {"输入预算", "不是输出 token 上限"},
+		"vision_timeout_seconds":         {"stream ID", "Host ABI"},
+		"vision_cancel_grace_seconds":    {"仅在 stream_close 后", "不增加正常请求延迟"},
+		"auto_compression_target_tokens": {"摘要检查点", "不会作为模型输出 token 上限"},
+	}
+	for name, parts := range checks {
+		for _, part := range parts {
+			if !strings.Contains(fields[name].Description, part) {
+				t.Fatalf("%s description %q is missing %q", name, fields[name].Description, part)
+			}
+		}
+	}
+}
+
 func TestClaudeRouteIsHandled(t *testing.T) {
 	if err := configure(nil); err != nil {
 		t.Fatal(err)

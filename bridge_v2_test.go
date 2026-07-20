@@ -265,13 +265,15 @@ func toolChoiceReferences(value any, name string) bool {
 
 func TestManagementPageContainsUnifiedControls(t *testing.T) {
 	runtime := testRuntime()
+	runtime.VisionTimeoutSeconds = 30
+	runtime.VisionCancelGraceSeconds = 25
 	html := managementHTML(runtime)
-	for _, want := range []string{"视觉桥接 v0.4.7", "OpenAI Chat", "Responses", "Claude Messages", "路由预览", "历史图片策略", "自动压缩长对话", "旧工具轨迹", "摘要检查点", "固定归档标记", "文本备用模型 1", "强制 low", "按实际截图的准确率和完成耗时排序", "可取消识别超时", "生产实测推荐 20 秒", "取消确认等待", "vision_cancel_grace_seconds:n('vision_cancel_grace_seconds')", "缓存键包含图片与附近任务", "保存并重新加载插件"} {
+	for _, want := range []string{"视觉桥接 v0.4.7", "OpenAI Chat", "Responses", "Claude Messages", "路由预览", "历史图片策略", "自动压缩长对话", "旧工具轨迹", "摘要检查点", "固定归档标记", "文本备用模型 1", "固定 low 思考", "不设置输出 token 上限", "按实际截图的准确率和完成耗时排序", "可取消识别超时", "填写 30", "首包前仍受 Host ABI 限制", "取消确认等待", "填写 25", "正常请求不增加此延迟", "setValue('vision_cancel_grace_seconds',C.vision_cancel_grace_seconds)", "vision_cancel_grace_seconds:n('vision_cancel_grace_seconds')", `"vision_timeout_seconds":30`, `"vision_cancel_grace_seconds":25`, "缓存键包含图片与附近任务", "保存并重新加载插件"} {
 		if !strings.Contains(html, want) {
 			t.Fatalf("missing %q", want)
 		}
 	}
-	for _, stale := range []string{"视觉桥接 v0.4.1.2", "单模型软延迟预算（秒）"} {
+	for _, stale := range []string{"视觉桥接 v0.4.1.2", "单模型软延迟预算（秒）", "CPA Host 暂不支持取消", "生产实测推荐 20 秒", "生产建议保持 15 秒"} {
 		if strings.Contains(html, stale) {
 			t.Fatalf("stale management text %q is still present", stale)
 		}
@@ -279,6 +281,15 @@ func TestManagementPageContainsUnifiedControls(t *testing.T) {
 	for _, removed := range []string{"vision_output_tokens", "识别输出上限"} {
 		if strings.Contains(html, removed) {
 			t.Fatalf("removed management field %q is still present", removed)
+		}
+	}
+	for snippet, wantCount := range map[string]int{
+		`name="vision_cancel_grace_seconds"`:                                    1,
+		"setValue('vision_cancel_grace_seconds',C.vision_cancel_grace_seconds)": 1,
+		"vision_cancel_grace_seconds:n('vision_cancel_grace_seconds')":          1,
+	} {
+		if got := strings.Count(html, snippet); got != wantCount {
+			t.Fatalf("%q occurs %d times, want %d", snippet, got, wantCount)
 		}
 	}
 }

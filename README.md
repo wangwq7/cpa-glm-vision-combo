@@ -160,7 +160,7 @@ plugins:
 | `max_image_data_bytes` | data URL 解码后单图上限 | 默认 12 MiB |
 | `strict_vision_failure` | 所有视觉候选失败时是否报错 | 生产建议开启，避免主模型在看不到图时猜测 |
 
-高级用户可使用 `vision_models` 为每个视觉候选分别设置 `context_limit`、`context_budget`、`timeout_seconds` 和 `enabled`。不要同时依赖高级列表和旧式 `vision_primary_model` 字段；旧式字段存在时会优先生成兼容视觉链。
+CPA Manager Plus 参数页使用 `vision_primary_model` 与三个备用字段维护四级视觉链，避免和高级配置同时出现。高级用户仍可直接在 YAML 中使用 `vision_models`，为每个视觉候选分别设置 `context_limit`、`context_budget`、`timeout_seconds` 和 `enabled`；不要同时依赖两套字段，旧式字段存在时会优先生成兼容视觉链。
 
 > **重要：** 若某个模型同时出现在 `primary_model` / `text_fallback_models` 与视觉候选中，配置校验会失败，插件无法注册。管理页保存时也会前端拦截并提示冲突模型名。
 
