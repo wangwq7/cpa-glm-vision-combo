@@ -420,7 +420,7 @@ func execute(raw []byte) ([]byte, error) {
 		cfg.events.finish(event, err)
 		return nil, err
 	}
-	body, err = prepareFinalTextBody(body, cfg, req.HostCallbackID, event)
+	body, err = prepareTextHostBody(body, protocol, cfg, req.HostCallbackID, event)
 	if err != nil {
 		cfg.events.stage(event, "主上下文预算", "失败", cfg.PrimaryModel, err.Error(), time.Now())
 		cfg.events.finish(event, err)
@@ -461,7 +461,7 @@ func executeStream(raw []byte) ([]byte, error) {
 			cfg.events.stage(event, "纯文本直达", "完成", cfg.PrimaryModel, "未检测到图片，跳过视觉候选链。", time.Now())
 		}
 		if err == nil {
-			body, err = prepareFinalTextBody(body, cfg, req.HostCallbackID, event)
+			body, err = prepareTextHostBody(body, protocol, cfg, req.HostCallbackID, event)
 		}
 		if err == nil {
 			primaryStarted := time.Now()
@@ -480,6 +480,52 @@ func executeStream(raw []byte) ([]byte, error) {
 		closePluginStream(req.StreamID, err)
 	}()
 	return okEnvelope(map[string]any{"headers": http.Header{"Content-Type": []string{"text/event-stream"}}})
+}
+
+func prepareTextHostBody(raw []byte, protocol string, cfg runtimeConfig, callbackID string, event *comboEvent) ([]byte, error) {
+	body, normalized, err := normalizeResponsesStringInput(raw, protocol)
+	if err != nil {
+		return nil, err
+	}
+	if normalized {
+		cfg.events.stage(event, "规范化 Responses 输入", "完成", cfg.PrimaryModel, "字符串 input 已转换为等价的标准 user message 数组；其他请求参数保持不变。", time.Now())
+	}
+	return prepareFinalTextBody(body, cfg, callbackID, event)
+}
+
+func normalizeResponsesStringInput(raw []byte, protocol string) ([]byte, bool, error) {
+	if normalizeProtocol(protocol) != "openai-response" {
+		return raw, false, nil
+	}
+	var root map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &root); err != nil {
+		return nil, false, fmt.Errorf("cannot normalize invalid openai-response request JSON: %w", err)
+	}
+	inputRaw, exists := root["input"]
+	if !exists {
+		return raw, false, nil
+	}
+	var text string
+	if err := json.Unmarshal(inputRaw, &text); err != nil {
+		return raw, false, nil
+	}
+	input, err := json.Marshal([]any{map[string]any{
+		"type": "message",
+		"role": "user",
+		"content": []any{map[string]any{
+			"type": "input_text",
+			"text": text,
+		}},
+	}})
+	if err != nil {
+		return nil, false, fmt.Errorf("cannot encode normalized openai-response input: %w", err)
+	}
+	root["input"] = input
+	body, err := json.Marshal(root)
+	if err != nil {
+		return nil, false, fmt.Errorf("cannot encode normalized openai-response request: %w", err)
+	}
+	return body, true, nil
 }
 
 func preparePrimaryBody(raw []byte, protocol string, cfg runtimeConfig, callbackID string, event *comboEvent) ([]byte, int, error) {

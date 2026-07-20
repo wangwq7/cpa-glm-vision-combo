@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -75,6 +76,97 @@ func TestSupportedProtocolRoutesAreHandled(t *testing.T) {
 			}
 			if !response.Handled || response.TargetKind != pluginapi.ModelRouteTargetSelf {
 				t.Fatalf("route response = %#v", response)
+			}
+		})
+	}
+}
+
+func TestResponsesStringInputIsNormalizedForTextHost(t *testing.T) {
+	for _, stream := range []bool{false, true} {
+		t.Run(fmt.Sprintf("stream=%t", stream), func(t *testing.T) {
+			raw, err := json.Marshal(map[string]any{
+				"model":               "glm-5.2-vision-combo",
+				"instructions":        "Keep this instruction.",
+				"input":               "请由首选 GLM 回答",
+				"stream":              stream,
+				"max_output_tokens":   4096,
+				"parallel_tool_calls": true,
+				"metadata":            map[string]any{"trace": "keep-me"},
+				"tools": []any{map[string]any{
+					"type":        "function",
+					"name":        "exec",
+					"description": "run a command",
+					"parameters":  map[string]any{"type": "object"},
+				}},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			got, changed, err := normalizeResponsesStringInput(raw, "openai-response")
+			if err != nil || !changed {
+				t.Fatalf("changed=%v err=%v body=%s", changed, err, got)
+			}
+			var root map[string]any
+			if err := json.Unmarshal(got, &root); err != nil {
+				t.Fatal(err)
+			}
+			input, _ := root["input"].([]any)
+			if len(input) != 1 {
+				t.Fatalf("input=%#v", root["input"])
+			}
+			message, _ := input[0].(map[string]any)
+			if message["type"] != "message" || message["role"] != "user" {
+				t.Fatalf("message=%#v", message)
+			}
+			content, _ := message["content"].([]any)
+			part, _ := content[0].(map[string]any)
+			if len(content) != 1 || part["type"] != "input_text" || part["text"] != "请由首选 GLM 回答" {
+				t.Fatalf("content=%#v", message["content"])
+			}
+			if root["model"] != "glm-5.2-vision-combo" ||
+				root["instructions"] != "Keep this instruction." ||
+				root["stream"] != stream ||
+				root["parallel_tool_calls"] != true {
+				t.Fatalf("top-level fields changed: %#v", root)
+			}
+			metadata, _ := root["metadata"].(map[string]any)
+			tools, _ := root["tools"].([]any)
+			tool, _ := tools[0].(map[string]any)
+			if metadata["trace"] != "keep-me" || tool["name"] != "exec" {
+				t.Fatalf("metadata/tools changed: %#v", root)
+			}
+		})
+	}
+}
+
+func TestResponsesArrayAndOtherProtocolsRemainUnchanged(t *testing.T) {
+	tests := []struct {
+		name     string
+		protocol string
+		raw      string
+	}{
+		{
+			name:     "responses array",
+			protocol: "openai-response",
+			raw:      `{"model":"combo","input":[{"role":"user","content":[{"type":"input_text","text":"hello"}]}],"stream":true}`,
+		},
+		{
+			name:     "openai chat",
+			protocol: "openai",
+			raw:      `{"model":"combo","input":"leave this field alone","messages":[{"role":"user","content":"hello"}]}`,
+		},
+		{
+			name:     "claude",
+			protocol: "claude",
+			raw:      `{"model":"combo","input":"leave this field alone","messages":[{"role":"user","content":"hello"}]}`,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got, changed, err := normalizeResponsesStringInput([]byte(test.raw), test.protocol)
+			if err != nil || changed || string(got) != test.raw {
+				t.Fatalf("changed=%v err=%v body=%s", changed, err, got)
 			}
 		})
 	}
