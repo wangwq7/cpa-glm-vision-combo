@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
@@ -25,6 +26,13 @@ func prepareFinalTextBody(raw []byte, cfg runtimeConfig, callbackID string, even
 		cfg.events.stage(event, "旧工具轨迹归档", "完成", "本地确定性处理", detail, compactionStarted)
 	}
 	raw = compacted
+	raw, removedMaxTokens, err := removeFinalTextMaxTokens(raw)
+	if err != nil {
+		return nil, err
+	}
+	if removedMaxTokens {
+		cfg.events.stage(event, "移除最终输出上限", "完成", cfg.PrimaryModel, "已移除客户端 max_tokens，让最终文本模型自然结束；客户端思考配置与视觉子请求的独立预算保持不变。", time.Now())
+	}
 	initialTokens := estimateBodyTokens(raw)
 	cfg.events.stage(event, "文本上下文预检", "完成", cfg.PrimaryModel, fmt.Sprintf("附件与旧工具轨迹处理后请求约 %d token；自动压缩阈值 %d，主模型工作预算 %d。", initialTokens, cfg.AutoCompressionThresholdTokens, cfg.PrimaryContextBudgetTokens), time.Now())
 	if initialTokens < cfg.AutoCompressionThresholdTokens {
@@ -101,6 +109,25 @@ func prepareFinalTextBody(raw []byte, cfg runtimeConfig, callbackID string, even
 	detail := fmt.Sprintf("历史前缀 %d 条已生成可复用摘要；保留最近 %d 条原文。后续追加少量对话将直接复用，不再逐轮重新压缩。", prefixCount, len(recent))
 	cfg.events.stage(event, stageName, "完成", compressionModelName(cfg), detail, started)
 	return encoded, nil
+}
+
+func removeFinalTextMaxTokens(raw []byte) ([]byte, bool, error) {
+	if !bytes.Contains(raw, []byte(`"max_tokens"`)) {
+		return raw, false, nil
+	}
+	var root map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &root); err != nil {
+		return nil, false, fmt.Errorf("cannot remove final text max_tokens from invalid request JSON: %w", err)
+	}
+	if _, exists := root["max_tokens"]; !exists {
+		return raw, false, nil
+	}
+	delete(root, "max_tokens")
+	encoded, err := json.Marshal(root)
+	if err != nil {
+		return nil, false, fmt.Errorf("cannot encode final text request without max_tokens: %w", err)
+	}
+	return encoded, true, nil
 }
 
 func conversationField(root map[string]any) (string, []any, bool) {

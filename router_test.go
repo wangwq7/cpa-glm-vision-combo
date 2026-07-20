@@ -125,7 +125,7 @@ func TestVisionRequestAndResponse(t *testing.T) {
 	if err := json.Unmarshal(request, &decoded); err != nil {
 		t.Fatal(err)
 	}
-	if decoded["model"] != "vision(low)" || decoded["reasoning_effort"] != "low" || decoded["stream"] != true {
+	if decoded["model"] != "vision(low)" || decoded["reasoning_effort"] != "low" || decoded["stream"] != true || decoded["max_tokens"] != float64(100) {
 		t.Fatal(decoded)
 	}
 	if got := extractVisionText([]byte(`{"choices":[{"message":{"content":"diagram: one box"}}]}`)); got != "diagram: one box" {

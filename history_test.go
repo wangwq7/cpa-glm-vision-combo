@@ -149,6 +149,56 @@ func TestTextContextPrecheckEventIsRecordedBelowCompressionThreshold(t *testing.
 	assertEventStage(t, cfg.events, event.ID, "文本上下文预检")
 }
 
+func TestFinalTextBodyRemovesOnlyTopLevelMaxTokens(t *testing.T) {
+	cfg := testRuntime()
+	defer cfg.cache.close()
+	event := cfg.events.begin("combo", "glm", false)
+	raw := []byte(`{
+		"model":"glm-5.2-vision-combo",
+		"max_tokens":50,
+		"reasoning_effort":"xhigh",
+		"thinking":{"type":"enabled"},
+		"messages":[{"role":"user","content":"solve"}],
+		"tools":[{"type":"function","function":{"name":"run","parameters":{"type":"object","properties":{"max_tokens":{"type":"integer"}}}}}]
+	}`)
+
+	got, err := prepareFinalTextBody(raw, cfg, "", event)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var root map[string]any
+	if err := json.Unmarshal(got, &root); err != nil {
+		t.Fatal(err)
+	}
+	if _, exists := root["max_tokens"]; exists {
+		t.Fatalf("top-level max_tokens was retained: %s", got)
+	}
+	if root["reasoning_effort"] != "xhigh" {
+		t.Fatalf("reasoning_effort changed: %s", got)
+	}
+	thinking, _ := root["thinking"].(map[string]any)
+	if thinking["type"] != "enabled" {
+		t.Fatalf("thinking config changed: %s", got)
+	}
+	if !strings.Contains(string(got), `"properties":{"max_tokens":{"type":"integer"}}`) {
+		t.Fatalf("nested tool schema was changed: %s", got)
+	}
+	assertEventStage(t, cfg.events, event.ID, "移除最终输出上限")
+}
+
+func TestFinalTextBodyWithoutMaxTokensRemainsByteIdentical(t *testing.T) {
+	cfg := testRuntime()
+	defer cfg.cache.close()
+	raw := []byte(`{ "model": "glm-5.2-vision-combo", "reasoning_effort": "low", "messages": [{"role":"user","content":"hello"}] }`)
+	got, err := prepareFinalTextBody(raw, cfg, "", cfg.events.begin("combo", "glm", false))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != string(raw) {
+		t.Fatalf("request without max_tokens changed:\nwant=%s\ngot=%s", raw, got)
+	}
+}
+
 func TestSmallAppendedTurnReusesCheckpointWithoutSummarizing(t *testing.T) {
 	var calls atomic.Int32
 	cfg := checkpointTestRuntime(&calls)
