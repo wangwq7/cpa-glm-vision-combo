@@ -39,7 +39,7 @@ import (
 
 const pluginID = "glm-vision-combo"
 
-var pluginVersion = "0.4.7"
+var pluginVersion = "0.5"
 var configured atomic.Value
 var telemetry = newEventStore(100)
 
@@ -341,7 +341,7 @@ func metadata() pluginapi.Metadata {
 	}}
 }
 func pluginRegistration() registration {
-	return registration{SchemaVersion: pluginabi.SchemaVersion, Metadata: metadata(), Capabilities: capabilities{ModelProvider: true, ModelRouter: true, Executor: true, ExecutorModelScope: string(pluginapi.ExecutorModelScopeStatic), ExecutorInputFormats: []string{"openai", "claude"}, ExecutorOutputFormats: []string{"openai", "claude"}, ManagementAPI: true}}
+	return registration{SchemaVersion: pluginabi.SchemaVersion, Metadata: metadata(), Capabilities: capabilities{ModelProvider: true, ModelRouter: true, Executor: true, ExecutorModelScope: string(pluginapi.ExecutorModelScopeStatic), ExecutorInputFormats: []string{"openai", "openai-response", "claude"}, ExecutorOutputFormats: []string{"openai", "openai-response", "claude"}, ManagementAPI: true}}
 }
 func comboModels(cfg runtimeConfig) []pluginapi.ModelInfo {
 	// Only expose the single configured combo_model. Aliases are ignored for
@@ -383,7 +383,7 @@ func normalizeProtocol(value string) string {
 }
 
 func isSupportedProtocol(value string) bool {
-	return value == "openai" || value == "claude"
+	return value == "openai" || value == "openai-response" || value == "claude"
 }
 
 func executorProtocol(req rpcExecutorRequest) (string, error) {

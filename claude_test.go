@@ -12,10 +12,10 @@ import (
 
 func TestPluginRegistersOpenAIAndClaudeProtocols(t *testing.T) {
 	registration := pluginRegistration()
-	if got := strings.Join(registration.Capabilities.ExecutorInputFormats, ","); got != "openai,claude" {
+	if got := strings.Join(registration.Capabilities.ExecutorInputFormats, ","); got != "openai,openai-response,claude" {
 		t.Fatalf("input formats = %q", got)
 	}
-	if got := strings.Join(registration.Capabilities.ExecutorOutputFormats, ","); got != "openai,claude" {
+	if got := strings.Join(registration.Capabilities.ExecutorOutputFormats, ","); got != "openai,openai-response,claude" {
 		t.Fatalf("output formats = %q", got)
 	}
 }
@@ -51,28 +51,32 @@ func TestManagementMetadataMatchesCurrentParameters(t *testing.T) {
 	}
 }
 
-func TestClaudeRouteIsHandled(t *testing.T) {
+func TestSupportedProtocolRoutesAreHandled(t *testing.T) {
 	if err := configure(nil); err != nil {
 		t.Fatal(err)
 	}
-	raw, _ := json.Marshal(rpcRouteRequest{ModelRouteRequest: pluginapi.ModelRouteRequest{
-		SourceFormat:   "claude",
-		RequestedModel: defaultPluginConfig().ComboModel,
-	}})
-	encoded, err := routeModel(raw)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var outer envelope
-	if err := json.Unmarshal(encoded, &outer); err != nil {
-		t.Fatal(err)
-	}
-	var response pluginapi.ModelRouteResponse
-	if err := json.Unmarshal(outer.Result, &response); err != nil {
-		t.Fatal(err)
-	}
-	if !response.Handled || response.TargetKind != pluginapi.ModelRouteTargetSelf {
-		t.Fatalf("route response = %#v", response)
+	for _, protocol := range []string{"openai", "openai-response", "claude"} {
+		t.Run(protocol, func(t *testing.T) {
+			raw, _ := json.Marshal(rpcRouteRequest{ModelRouteRequest: pluginapi.ModelRouteRequest{
+				SourceFormat:   protocol,
+				RequestedModel: defaultPluginConfig().ComboModel,
+			}})
+			encoded, err := routeModel(raw)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var outer envelope
+			if err := json.Unmarshal(encoded, &outer); err != nil {
+				t.Fatal(err)
+			}
+			var response pluginapi.ModelRouteResponse
+			if err := json.Unmarshal(outer.Result, &response); err != nil {
+				t.Fatal(err)
+			}
+			if !response.Handled || response.TargetKind != pluginapi.ModelRouteTargetSelf {
+				t.Fatalf("route response = %#v", response)
+			}
+		})
 	}
 }
 

@@ -126,7 +126,7 @@ func TestProcessedImagesRemoveOnlyTheViewImageTool(t *testing.T) {
 		},
 		{
 			name:     "openai responses",
-			protocol: "openai",
+			protocol: "openai-response",
 			raw:      `{"model":"glm-5.2-vision-combo","input":[{"type":"additional_tools","role":"developer","tools":[{"type":"function","name":"view_image"},{"type":"function","name":"exec"}]},{"role":"user","content":[{"type":"input_text","text":"inspect"},{"type":"input_image","image_url":"data:image/png;base64,YQ=="}]}],"tools":[{"type":"function","name":"view_image"},{"type":"function","name":"exec"}],"tool_choice":{"type":"allowed_tools","mode":"auto","tools":[{"type":"function","name":"view_image"},{"type":"function","name":"exec"}]}}`,
 		},
 	}
@@ -268,7 +268,7 @@ func TestManagementPageContainsUnifiedControls(t *testing.T) {
 	runtime.VisionTimeoutSeconds = 30
 	runtime.VisionCancelGraceSeconds = 25
 	html := managementHTML(runtime)
-	for _, want := range []string{"视觉桥接 v0.4.7", "OpenAI Chat", "Responses", "Claude Messages", "路由预览", "历史图片策略", "自动压缩长对话", "旧工具轨迹", "摘要检查点", "固定归档标记", "文本备用模型 1", "固定 low 思考", "不设置输出 token 上限", "按实际截图的准确率和完成耗时排序", "可取消识别超时", "填写 30", "首包前仍受 Host ABI 限制", "取消确认等待", "填写 25", "正常请求不增加此延迟", "setValue('vision_cancel_grace_seconds',C.vision_cancel_grace_seconds)", "vision_cancel_grace_seconds:n('vision_cancel_grace_seconds')", `"vision_timeout_seconds":30`, `"vision_cancel_grace_seconds":25`, "缓存键包含图片与附近任务", "保存并重新加载插件"} {
+	for _, want := range []string{"视觉桥接 v0.5", "OpenAI Chat", "Responses", "Claude Messages", "路由预览", "历史图片策略", "自动压缩长对话", "旧工具轨迹", "摘要检查点", "固定归档标记", "文本备用模型 1", "固定 low 思考", "不设置输出 token 上限", "按实际截图的准确率和完成耗时排序", "可取消识别超时", "填写 30", "首包前仍受 Host ABI 限制", "取消确认等待", "填写 25", "正常请求不增加此延迟", "setValue('vision_cancel_grace_seconds',C.vision_cancel_grace_seconds)", "vision_cancel_grace_seconds:n('vision_cancel_grace_seconds')", `"vision_timeout_seconds":30`, `"vision_cancel_grace_seconds":25`, "缓存键包含图片与附近任务", "保存并重新加载插件"} {
 		if !strings.Contains(html, want) {
 			t.Fatalf("missing %q", want)
 		}
