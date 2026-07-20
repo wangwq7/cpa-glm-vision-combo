@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"errors"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -80,6 +81,58 @@ func TestVisionStreamAccumulatorHandlesProviderStreamDialects(t *testing.T) {
 				t.Fatalf("text = %q, want %q", got, test.want)
 			}
 		})
+	}
+}
+
+func TestVisionStreamAccumulatorRejectsProviderTokenTruncation(t *testing.T) {
+	tests := []struct {
+		name    string
+		payload string
+	}{
+		{name: "openai chat", payload: `data: {"choices":[{"delta":{"content":"partial"},"finish_reason":"length"}]}`},
+		{name: "anthropic", payload: `data: {"type":"message_delta","delta":{"stop_reason":"max_tokens"}}`},
+		{name: "responses", payload: `data: {"type":"response.incomplete","response":{"status":"incomplete","incomplete_details":{"reason":"max_output_tokens"}}}`},
+		{name: "gemini", payload: `data: {"response":{"candidates":[{"content":{"parts":[{"text":"partial"}]},"finishReason":"MAX_TOKENS"}]}}`},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			accumulator := &visionStreamAccumulator{}
+			_, done, err := accumulator.consume(visionStreamReadResult{response: pluginapi.HostModelStreamReadResponse{
+				Payload: []byte(test.payload),
+				Done:    true,
+			}})
+			if err == nil || done || !strings.Contains(err.Error(), "truncated") {
+				t.Fatalf("done=%v err=%v", done, err)
+			}
+		})
+	}
+}
+
+func TestResponseTruncationReasonIgnoresNormalStops(t *testing.T) {
+	for _, raw := range []string{
+		`{"choices":[{"finish_reason":"stop","message":{"content":"complete"}}]}`,
+		`{"stop_reason":"end_turn","content":[{"type":"text","text":"complete"}]}`,
+		`{"response":{"status":"completed","candidates":[{"finishReason":"STOP"}]}}`,
+	} {
+		if reason := responseTruncationReason([]byte(raw)); reason != "" {
+			t.Fatalf("reason=%q for %s", reason, raw)
+		}
+	}
+}
+
+func TestResponseTruncationReasonIgnoresToolBusinessFields(t *testing.T) {
+	raw := []byte(`{
+		"choices":[{
+			"finish_reason":"tool_calls",
+			"message":{"tool_calls":[{"function":{"arguments":{
+				"status":"incomplete",
+				"finish_reason":"length",
+				"stop_reason":"max_tokens"
+			}}}]}
+		}]
+	}`)
+	if reason := responseTruncationReason(raw); reason != "" {
+		t.Fatalf("tool business fields were treated as truncation: %q", reason)
 	}
 }
 

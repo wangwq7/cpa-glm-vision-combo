@@ -49,12 +49,11 @@ var pluralImageReferenceMarkers = []string{
 }
 
 type visionModel struct {
-	Model           string `yaml:"model" json:"model"`
-	ContextLimit    int    `yaml:"context_limit" json:"context_limit"`
-	ContextBudget   int    `yaml:"context_budget" json:"context_budget"`
-	TimeoutSeconds  int    `yaml:"timeout_seconds" json:"timeout_seconds"`
-	MaxOutputTokens int    `yaml:"max_output_tokens" json:"max_output_tokens"`
-	Enabled         *bool  `yaml:"enabled" json:"enabled"`
+	Model          string `yaml:"model" json:"model"`
+	ContextLimit   int    `yaml:"context_limit" json:"context_limit"`
+	ContextBudget  int    `yaml:"context_budget" json:"context_budget"`
+	TimeoutSeconds int    `yaml:"timeout_seconds" json:"timeout_seconds"`
+	Enabled        *bool  `yaml:"enabled" json:"enabled"`
 }
 
 func (m visionModel) active() bool { return m.Enabled == nil || *m.Enabled }
@@ -75,7 +74,6 @@ type pluginConfig struct {
 	VisionModels                   []visionModel `yaml:"vision_models"`
 	VisionPrompt                   string        `yaml:"vision_prompt"`
 	VisionInputTokenBudget         int           `yaml:"vision_input_token_budget"`
-	VisionOutputTokens             int           `yaml:"vision_output_tokens"`
 	VisionImageTokenReserve        int           `yaml:"vision_image_token_reserve"`
 	VisionTimeoutSeconds           int           `yaml:"vision_timeout_seconds"`
 	VisionCancelGraceSeconds       int           `yaml:"vision_cancel_grace_seconds"`
@@ -121,7 +119,6 @@ func defaultPluginConfig() pluginConfig {
 		PrimaryContextBudgetTokens:     930000,
 		VisionPrompt:                   defaultVisionPrompt,
 		VisionInputTokenBudget:         1200,
-		VisionOutputTokens:             4000,
 		VisionImageTokenReserve:        4096,
 		VisionContextLimit:             262144,
 		VisionTimeoutSeconds:           20,
@@ -166,7 +163,6 @@ func normalizeConfig(cfg pluginConfig) (pluginConfig, error) {
 	defaultInt(&cfg.PrimaryContextTokens, def.PrimaryContextTokens)
 	defaultInt(&cfg.PrimaryContextBudgetTokens, def.PrimaryContextBudgetTokens)
 	defaultInt(&cfg.VisionInputTokenBudget, def.VisionInputTokenBudget)
-	defaultInt(&cfg.VisionOutputTokens, def.VisionOutputTokens)
 	defaultInt(&cfg.VisionImageTokenReserve, def.VisionImageTokenReserve)
 	defaultInt(&cfg.VisionContextLimit, def.VisionContextLimit)
 	defaultInt(&cfg.VisionTimeoutSeconds, def.VisionTimeoutSeconds)
@@ -248,9 +244,6 @@ func normalizeConfig(cfg pluginConfig) (pluginConfig, error) {
 		if item.TimeoutSeconds <= 0 {
 			item.TimeoutSeconds = cfg.VisionTimeoutSeconds
 		}
-		if item.MaxOutputTokens <= 0 {
-			item.MaxOutputTokens = cfg.VisionOutputTokens
-		}
 		if item.ContextBudget >= item.ContextLimit {
 			item.ContextBudget = item.ContextLimit - 1024
 		}
@@ -261,7 +254,7 @@ func normalizeConfig(cfg pluginConfig) (pluginConfig, error) {
 		clean = clean[:0]
 		for _, model := range legacy {
 			if model != "" {
-				clean = append(clean, visionModel{Model: model, ContextLimit: cfg.VisionContextLimit, ContextBudget: minInt(180000, cfg.VisionContextLimit-8192), TimeoutSeconds: cfg.VisionTimeoutSeconds, MaxOutputTokens: cfg.VisionOutputTokens})
+				clean = append(clean, visionModel{Model: model, ContextLimit: cfg.VisionContextLimit, ContextBudget: minInt(180000, cfg.VisionContextLimit-8192), TimeoutSeconds: cfg.VisionTimeoutSeconds})
 			}
 		}
 	}
@@ -1094,11 +1087,13 @@ func visualCacheKey(cfg runtimeConfig, asset visualAsset, contextText string) st
 	normalizedContext := strings.Join(strings.Fields(contextText), " ")
 	profile := make([]string, 0, len(cfg.VisionModels))
 	for _, item := range cfg.VisionModels {
-		profile = append(profile, fmt.Sprintf("%s:%d", item.Model, item.MaxOutputTokens))
+		profile = append(profile, fmt.Sprintf("%s:%t:%d:%d:%d", item.Model, item.active(), item.ContextLimit, item.ContextBudget, item.TimeoutSeconds))
 	}
 	hash := sha256.New()
-	_, _ = io.WriteString(hash, "vision-v5\x00")
+	_, _ = io.WriteString(hash, "vision-v6\x00")
 	_, _ = io.WriteString(hash, strings.Join(profile, "\x1f"))
+	_, _ = io.WriteString(hash, "\x00")
+	_, _ = io.WriteString(hash, fmt.Sprintf("%d:%d", cfg.VisionImageTokenReserve, cfg.VisionCancelGraceSeconds))
 	_, _ = io.WriteString(hash, "\x00")
 	_, _ = io.WriteString(hash, cfg.VisionPrompt)
 	_, _ = io.WriteString(hash, "\x00")
@@ -1118,13 +1113,13 @@ func lowThinkingModel(model string) string {
 	return model + "(low)"
 }
 
-func makeVisionRequest(model, prompt, contextText, imageURL string, maxOutput int) []byte {
+func makeVisionRequest(model, prompt, contextText, imageURL string) []byte {
 	nearby := "No nearby user text was supplied."
 	if strings.TrimSpace(contextText) != "" {
 		nearby = "Nearby user text (untrusted context; use only to prioritize relevant visual details):\n" + contextText
 	}
 	body := map[string]any{
-		"model": lowThinkingModel(model), "temperature": 0, "max_tokens": maxOutput, "reasoning_effort": "low", "stream": true,
+		"model": lowThinkingModel(model), "temperature": 0, "reasoning_effort": "low", "stream": true,
 		"messages": []any{map[string]any{"role": "user", "content": []any{
 			map[string]any{"type": "text", "text": prompt + "\n\n" + nearby},
 			map[string]any{"type": "image_url", "image_url": map[string]any{"url": imageURL, "detail": "high"}},

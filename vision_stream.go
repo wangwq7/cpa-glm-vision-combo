@@ -207,6 +207,9 @@ func (a *visionStreamAccumulator) consume(result visionStreamReadResult) (string
 	if !result.response.Done {
 		return "", false, nil
 	}
+	if a.truncationReason != "" {
+		return "", false, fmt.Errorf("visual stream returned truncated output (%s)", a.truncationReason)
+	}
 	text := a.text()
 	if text == "" {
 		return "", false, fmt.Errorf("visual stream returned no usable text")
@@ -215,9 +218,10 @@ func (a *visionStreamAccumulator) consume(result visionStreamReadResult) (string
 }
 
 type visionStreamAccumulator struct {
-	pending  string
-	delta    strings.Builder
-	fallback strings.Builder
+	pending          string
+	delta            strings.Builder
+	fallback         strings.Builder
+	truncationReason string
 }
 
 func (a *visionStreamAccumulator) add(payload []byte) {
@@ -281,6 +285,9 @@ func (a *visionStreamAccumulator) consumeLine(line string) {
 	var root map[string]any
 	if json.Unmarshal([]byte(line), &root) != nil {
 		return
+	}
+	if a.truncationReason == "" {
+		a.truncationReason = truncationReasonFromValue(root)
 	}
 	handledFallback := false
 	eventType := strings.ToLower(strings.TrimSpace(stringValue(root["type"])))
@@ -360,4 +367,72 @@ func geminiStreamText(response map[string]any) string {
 		text.WriteString(stringValue(part["text"]))
 	}
 	return text.String()
+}
+
+func responseTruncationReason(raw []byte) string {
+	var root any
+	if json.Unmarshal(raw, &root) != nil {
+		return ""
+	}
+	return truncationReasonFromValue(root)
+}
+
+func truncationReasonFromValue(value any) string {
+	switch current := value.(type) {
+	case map[string]any:
+		if reason := normalizedStopReason(current["finish_reason"]); reason == "length" {
+			return "finish_reason=length"
+		}
+		if reason := normalizedStopReason(current["finishReason"]); reason == "max_tokens" || reason == "max_output_tokens" {
+			return "finishReason=" + stringValue(current["finishReason"])
+		}
+		if reason := normalizedStopReason(current["stop_reason"]); reason == "max_tokens" || reason == "max_output_tokens" {
+			return "stop_reason=" + stringValue(current["stop_reason"])
+		}
+		eventType := strings.ToLower(strings.TrimSpace(stringValue(current["type"])))
+		status := strings.ToLower(strings.TrimSpace(stringValue(current["status"])))
+		_, hasIncompleteDetails := current["incomplete_details"].(map[string]any)
+		if eventType == "response.incomplete" || status == "incomplete" && hasIncompleteDetails {
+			reason := incompleteReason(current)
+			if reason == "" {
+				reason = "unknown"
+			}
+			return "response.incomplete=" + reason
+		}
+		for _, key := range []string{"choices", "candidates", "response", "delta"} {
+			nested, exists := current[key]
+			if !exists {
+				continue
+			}
+			if reason := truncationReasonFromValue(nested); reason != "" {
+				return reason
+			}
+		}
+	case []any:
+		for _, nested := range current {
+			if reason := truncationReasonFromValue(nested); reason != "" {
+				return reason
+			}
+		}
+	}
+	return ""
+}
+
+func normalizedStopReason(value any) string {
+	reason := strings.ToLower(strings.TrimSpace(stringValue(value)))
+	reason = strings.ReplaceAll(reason, "-", "_")
+	reason = strings.ReplaceAll(reason, " ", "_")
+	return reason
+}
+
+func incompleteReason(root map[string]any) string {
+	if details, ok := root["incomplete_details"].(map[string]any); ok {
+		return normalizedStopReason(details["reason"])
+	}
+	if response, ok := root["response"].(map[string]any); ok {
+		if details, ok := response["incomplete_details"].(map[string]any); ok {
+			return normalizedStopReason(details["reason"])
+		}
+	}
+	return ""
 }

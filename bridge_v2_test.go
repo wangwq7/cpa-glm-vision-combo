@@ -276,6 +276,11 @@ func TestManagementPageContainsUnifiedControls(t *testing.T) {
 			t.Fatalf("stale management text %q is still present", stale)
 		}
 	}
+	for _, removed := range []string{"vision_output_tokens", "识别输出上限"} {
+		if strings.Contains(html, removed) {
+			t.Fatalf("removed management field %q is still present", removed)
+		}
+	}
 }
 
 func TestRenderManagementPreview(t *testing.T) {

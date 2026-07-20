@@ -7,6 +7,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"gopkg.in/yaml.v3"
 )
 
 func testRuntime() runtimeConfig {
@@ -68,7 +70,7 @@ func TestHistoricalImageReferenceDetectionIsExplicit(t *testing.T) {
 }
 
 func TestVisionRequestUsesHighImageDetail(t *testing.T) {
-	raw := makeVisionRequest("vision-a", defaultVisionPrompt, "读取截图", "data:image/png;base64,YQ==", 4000)
+	raw := makeVisionRequest("vision-a", defaultVisionPrompt, "读取截图", "data:image/png;base64,YQ==")
 	var request map[string]any
 	if err := json.Unmarshal(raw, &request); err != nil {
 		t.Fatal(err)
@@ -120,13 +122,16 @@ func TestOversizedBase64ValidationStopsAtConfiguredLimit(t *testing.T) {
 }
 
 func TestVisionRequestAndResponse(t *testing.T) {
-	request := makeVisionRequest("vision", "prompt", "context", "data:image/png;base64,a", 100)
+	request := makeVisionRequest("vision", "prompt", "context", "data:image/png;base64,a")
 	var decoded map[string]any
 	if err := json.Unmarshal(request, &decoded); err != nil {
 		t.Fatal(err)
 	}
-	if decoded["model"] != "vision(low)" || decoded["reasoning_effort"] != "low" || decoded["stream"] != true || decoded["max_tokens"] != float64(100) {
+	if decoded["model"] != "vision(low)" || decoded["reasoning_effort"] != "low" || decoded["stream"] != true {
 		t.Fatal(decoded)
+	}
+	if _, exists := decoded["max_tokens"]; exists {
+		t.Fatalf("visual request retained top-level max_tokens: %s", request)
 	}
 	if got := extractVisionText([]byte(`{"choices":[{"message":{"content":"diagram: one box"}}]}`)); got != "diagram: one box" {
 		t.Fatal(got)
@@ -150,6 +155,30 @@ func TestVisionCancelGraceDefaultsAndCaps(t *testing.T) {
 	}
 	if normalized.VisionCancelGraceSeconds != 120 {
 		t.Fatalf("capped grace = %d, want 120", normalized.VisionCancelGraceSeconds)
+	}
+}
+
+func TestLegacyVisionOutputTokenFieldsAreIgnored(t *testing.T) {
+	raw := []byte(`
+enabled: true
+combo_model: combo
+primary_model: text
+vision_primary_model: vision
+vision_output_tokens: 4000
+vision_models:
+  - model: ignored-because-legacy-fields-win
+    max_output_tokens: 2000
+`)
+	var cfg pluginConfig
+	if err := yaml.Unmarshal(raw, &cfg); err != nil {
+		t.Fatal(err)
+	}
+	normalized, err := normalizeConfig(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(normalized.VisionModels) != 1 || normalized.VisionModels[0].Model != "vision" {
+		t.Fatalf("vision models=%#v", normalized.VisionModels)
 	}
 }
 

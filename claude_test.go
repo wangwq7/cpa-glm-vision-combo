@@ -107,6 +107,30 @@ func TestVisualCacheKeyIncludesModelProfile(t *testing.T) {
 	}
 }
 
+func TestVisualCacheKeyIncludesCandidateRoutingSettings(t *testing.T) {
+	base := testRuntime()
+	asset := visualAsset{URL: "data:image/png;base64,YQ=="}
+	wantDifferent := []runtimeConfig{base, base}
+	disabled := false
+	wantDifferent[0].VisionModels = append([]visionModel(nil), base.VisionModels...)
+	wantDifferent[0].VisionModels[0].Enabled = &disabled
+	wantDifferent[1].VisionModels = append([]visionModel(nil), base.VisionModels...)
+	wantDifferent[1].VisionModels[0].ContextBudget--
+	timeoutChanged := base
+	timeoutChanged.VisionModels = append([]visionModel(nil), base.VisionModels...)
+	timeoutChanged.VisionModels[0].TimeoutSeconds++
+	wantDifferent = append(wantDifferent, timeoutChanged)
+	reserveChanged := base
+	reserveChanged.VisionImageTokenReserve++
+	wantDifferent = append(wantDifferent, reserveChanged)
+	baseKey := visualCacheKey(base, asset, "读取错误代码")
+	for index, cfg := range wantDifferent {
+		if got := visualCacheKey(cfg, asset, "读取错误代码"); got == baseKey {
+			t.Fatalf("routing profile %d did not invalidate visual cache key", index)
+		}
+	}
+}
+
 func TestUnsupportedMediaFailsBeforeAnyVisionCall(t *testing.T) {
 	runtime := testRuntime()
 	raw := []byte(`{"messages":[{"role":"user","content":[

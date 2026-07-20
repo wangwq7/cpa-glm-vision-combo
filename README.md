@@ -104,7 +104,6 @@ plugins:
       vision_backup_model_3: claude-sonnet-4-6
       vision_context_limit: 262144
       vision_input_token_budget: 1200
-      vision_output_tokens: 4000
       vision_timeout_seconds: 20
       vision_cancel_grace_seconds: 15
 
@@ -148,7 +147,6 @@ plugins:
 | `vision_backup_model_1..3` | 顺序视觉备用链 | 可留空；最多四个视觉候选；**禁止**与文本链重复 |
 | `vision_context_limit` | 视觉模型上下文上限 | 256K 模型填 `262144` |
 | `vision_input_token_budget` | 发给视觉模型的附近文字预算 | 普通截图建议 800–2000 |
-| `vision_output_tokens` | 单张图片识别输出上限 | 普通截图 1K–4K，复杂表格可提高 |
 | `vision_timeout_seconds` | 已建立视觉流的可取消预算 | 建议 20–30 秒；从 CPA 返回 `stream_id` 后开始计时 |
 | `vision_cancel_grace_seconds` | 取消确认等待上限 | 默认 15 秒；未确认流结束时停止本次 fallback，避免重叠请求 |
 | `history_attachment_mode` | 历史图片处理模式 | 推荐 `onDemand`；`retain` 会增大上下文 |
@@ -162,7 +160,7 @@ plugins:
 | `max_image_data_bytes` | data URL 解码后单图上限 | 默认 12 MiB |
 | `strict_vision_failure` | 所有视觉候选失败时是否报错 | 生产建议开启，避免主模型在看不到图时猜测 |
 
-高级用户可使用 `vision_models` 为每个视觉候选分别设置 `context_limit`、`context_budget`、`timeout_seconds`、`max_output_tokens` 和 `enabled`。不要同时依赖高级列表和旧式 `vision_primary_model` 字段；旧式字段存在时会优先生成兼容视觉链。
+高级用户可使用 `vision_models` 为每个视觉候选分别设置 `context_limit`、`context_budget`、`timeout_seconds` 和 `enabled`。不要同时依赖高级列表和旧式 `vision_primary_model` 字段；旧式字段存在时会优先生成兼容视觉链。
 
 > **重要：** 若某个模型同时出现在 `primary_model` / `text_fallback_models` 与视觉候选中，配置校验会失败，插件无法注册。管理页保存时也会前端拦截并提示冲突模型名。
 

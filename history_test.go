@@ -199,6 +199,29 @@ func TestFinalTextBodyWithoutMaxTokensRemainsByteIdentical(t *testing.T) {
 	}
 }
 
+func TestHistoryCompressionRequestHasNoMaxTokens(t *testing.T) {
+	raw := makeHistoryCompressionRequest("glm", `[{"role":"user","content":"history"}]`, 12000)
+	var root map[string]any
+	if err := json.Unmarshal(raw, &root); err != nil {
+		t.Fatal(err)
+	}
+	if _, exists := root["max_tokens"]; exists {
+		t.Fatalf("compression request retained top-level max_tokens: %s", raw)
+	}
+	if root["stream"] != false || root["model"] != "glm" {
+		t.Fatalf("unexpected compression request: %s", raw)
+	}
+}
+
+func TestHistorySummaryTokenLimitAllowsSmallTokenizerVariance(t *testing.T) {
+	if got := historySummaryTokenLimit(12000); got != 15000 {
+		t.Fatalf("limit=%d, want 15000", got)
+	}
+	if got := historySummaryTokenLimit(50); got != 306 {
+		t.Fatalf("small target limit=%d, want 306", got)
+	}
+}
+
 func TestSmallAppendedTurnReusesCheckpointWithoutSummarizing(t *testing.T) {
 	var calls atomic.Int32
 	cfg := checkpointTestRuntime(&calls)

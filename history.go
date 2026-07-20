@@ -31,7 +31,7 @@ func prepareFinalTextBody(raw []byte, cfg runtimeConfig, callbackID string, even
 		return nil, err
 	}
 	if removedMaxTokens {
-		cfg.events.stage(event, "移除最终输出上限", "完成", cfg.PrimaryModel, "已移除客户端 max_tokens，让最终文本模型自然结束；客户端思考配置与视觉子请求的独立预算保持不变。", time.Now())
+		cfg.events.stage(event, "移除最终输出上限", "完成", cfg.PrimaryModel, "已移除客户端顶层 max_tokens，让最终文本模型自然结束；客户端思考配置和视觉子请求的 low 思考策略保持不变。", time.Now())
 	}
 	initialTokens := estimateBodyTokens(raw)
 	cfg.events.stage(event, "文本上下文预检", "完成", cfg.PrimaryModel, fmt.Sprintf("附件与旧工具轨迹处理后请求约 %d token；自动压缩阈值 %d，主模型工作预算 %d。", initialTokens, cfg.AutoCompressionThresholdTokens, cfg.PrimaryContextBudgetTokens), time.Now())
@@ -192,7 +192,7 @@ func compressedHistoryBody(root map[string]any, field string, persistent []any, 
 func historyCheckpointKeys(field string, items []any, cfg runtimeConfig) ([]string, error) {
 	models := uniqueModels(append([]string{compressionModelName(cfg)}, cfg.TextFallbackModels...))
 	digest := sha256.New()
-	digest.Write([]byte("history-checkpoint-v1\x00" + field + "\x00" + strings.Join(models, "\x00") + "\x00" + fmt.Sprint(cfg.AutoCompressionTargetTokens) + "\x00"))
+	digest.Write([]byte("history-checkpoint-v2\x00" + field + "\x00" + strings.Join(models, "\x00") + "\x00" + fmt.Sprint(cfg.AutoCompressionTargetTokens) + "\x00"))
 	keys := make([]string, 0, len(items))
 	var length [8]byte
 	for _, item := range items {
@@ -301,7 +301,7 @@ func splitText(text string, maxChars int) []string {
 
 func compressHistoryPiece(history string, target int, cfg runtimeConfig, callbackID string, event *comboEvent) (string, error) {
 	models := uniqueModels(append([]string{compressionModelName(cfg)}, cfg.TextFallbackModels...))
-	hash := sha256.Sum256([]byte("history-v1\x00" + strings.Join(models, "\x00") + "\x00" + fmt.Sprint(target) + "\x00" + history))
+	hash := sha256.Sum256([]byte("history-v2\x00" + strings.Join(models, "\x00") + "\x00" + fmt.Sprint(target) + "\x00" + history))
 	key := "history:" + hex.EncodeToString(hash[:])
 	if cached, ok := cfg.cache.get(key); ok {
 		cfg.events.stage(event, "读取压缩摘要缓存", "完成", "缓存", "相同历史片段命中缓存，未再次调用压缩模型。", time.Now())
@@ -311,23 +311,27 @@ func compressHistoryPiece(history string, target int, cfg runtimeConfig, callbac
 		var lastErr error
 		for _, model := range models {
 			started := time.Now()
-			body, _ := json.Marshal(map[string]any{
-				"model": model, "stream": false, "max_tokens": minInt(target, 65536),
-				"messages": []any{
-					map[string]any{"role": "system", "content": compressionInstruction(target)},
-					map[string]any{"role": "user", "content": "<history-data>\n" + history + "\n</history-data>"},
-				},
-			})
+			body := makeHistoryCompressionRequest(model, history, target)
 			response, callErr := hostExecuteWithTimeout(callbackID, model, body, 60)
 			if callErr != nil {
 				lastErr = callErr
 				cfg.events.stage(event, "长对话压缩模型", "失败", model, callErr.Error()+"；尝试下一个文本模型。", started)
 				continue
 			}
+			if reason := responseTruncationReason(response.Body); reason != "" {
+				lastErr = fmt.Errorf("compression model %s returned a truncated summary (%s)", model, reason)
+				cfg.events.stage(event, "长对话压缩模型", "失败", model, lastErr.Error()+"；拒绝缓存半截摘要并尝试下一个文本模型。", started)
+				continue
+			}
 			text := extractVisionText(response.Body)
 			if text == "" {
 				lastErr = fmt.Errorf("compression model %s returned no summary", model)
 				cfg.events.stage(event, "长对话压缩模型", "失败", model, lastErr.Error(), started)
+				continue
+			}
+			if estimated := estimateBodyTokens([]byte(text)); estimated > historySummaryTokenLimit(target) {
+				lastErr = fmt.Errorf("compression model %s returned an oversized summary (estimated %d tokens, target %d)", model, estimated, target)
+				cfg.events.stage(event, "长对话压缩模型", "失败", model, lastErr.Error()+"；拒绝缓存异常超长摘要并尝试下一个文本模型。", started)
 				continue
 			}
 			cfg.cache.set(key, "history", text, cacheTTL(cfg))
@@ -342,4 +346,30 @@ func compressHistoryPiece(history string, target int, cfg runtimeConfig, callbac
 		cfg.events.stage(event, "合并重复压缩请求", "完成", "缓存", "相同历史正在压缩，本请求复用了同一任务。", time.Now())
 	}
 	return value, err
+}
+
+func historySummaryTokenLimit(target int) int {
+	if target <= 0 {
+		return 0
+	}
+	// The local estimator is intentionally conservative and provider tokenizers
+	// differ, so allow 25% plus a small fixed margin before treating a model as
+	// having ignored the requested summary size.
+	margin := target / 4
+	if margin < 256 {
+		margin = 256
+	}
+	return target + margin
+}
+
+func makeHistoryCompressionRequest(model, history string, target int) []byte {
+	body, _ := json.Marshal(map[string]any{
+		"model":  model,
+		"stream": false,
+		"messages": []any{
+			map[string]any{"role": "system", "content": compressionInstruction(target)},
+			map[string]any{"role": "user", "content": "<history-data>\n" + history + "\n</history-data>"},
+		},
+	})
+	return body
 }

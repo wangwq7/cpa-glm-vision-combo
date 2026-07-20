@@ -36,7 +36,6 @@ block = """    glm-vision-combo:
       vision_backup_model_3: claude-sonnet-4-6
       vision_context_limit: 262144
       vision_input_token_budget: 1200
-      vision_output_tokens: 4000
       vision_timeout_seconds: 20
       vision_cancel_grace_seconds: 15
 

@@ -22,6 +22,7 @@ static void free_host_buffer(void* ptr, size_t len) { if (stored_host && stored_
 import "C"
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -161,7 +162,7 @@ func handleMethod(method string, payload []byte) ([]byte, error) {
 	case pluginabi.MethodExecutorExecuteStream:
 		return executeStream(payload)
 	case pluginabi.MethodExecutorCountTokens:
-		return okEnvelope(pluginapi.ExecutorResponse{Payload: []byte(`{"input_tokens":0}`)})
+		return countTokens(payload)
 	case pluginabi.MethodManagementRegister:
 		return okEnvelope(managementRegistration())
 	case pluginabi.MethodManagementHandle:
@@ -169,6 +170,96 @@ func handleMethod(method string, payload []byte) ([]byte, error) {
 	default:
 		return errorEnvelope("unknown_method", "unknown method: "+method, false), nil
 	}
+}
+
+func countTokens(raw []byte) ([]byte, error) {
+	var req rpcExecutorRequest
+	if err := json.Unmarshal(raw, &req); err != nil {
+		return nil, err
+	}
+	body := req.OriginalRequest
+	if len(body) == 0 {
+		body = req.Payload
+	}
+	payload, err := json.Marshal(map[string]int{"input_tokens": estimateExecutorInputTokens(body, currentConfig())})
+	if err != nil {
+		return nil, err
+	}
+	return okEnvelope(pluginapi.ExecutorResponse{Payload: payload})
+}
+
+func estimateExecutorInputTokens(body []byte, cfg runtimeConfig) int {
+	if len(body) == 0 {
+		return 0
+	}
+	var root any
+	if json.Unmarshal(body, &root) != nil {
+		return estimateBodyTokens(body)
+	}
+	assets := collectVisualAssets(root)
+	if len(assets) == 0 {
+		return estimateBodyTokens(body)
+	}
+	latestIndex, latestText := latestUserTurn(root)
+	for _, asset := range assets {
+		if asset.ItemIndex > latestIndex {
+			latestIndex = asset.ItemIndex
+		}
+	}
+	full := make(map[string]bool, len(assets))
+	historical := make([]visualAsset, 0, len(assets))
+	currentCount := 0
+	for _, asset := range assets {
+		if asset.ItemIndex == latestIndex {
+			full[asset.ID] = true
+			currentCount++
+		} else {
+			historical = append(historical, asset)
+		}
+	}
+	if cfg.HistoryAttachmentMode == "retain" {
+		for _, asset := range historical {
+			full[asset.ID] = true
+		}
+	} else if restoreCount := historicalImageRestoreCount(latestText, cfg.HistoryRestoreMaxAttachments); restoreCount > 0 {
+		slots := cfg.MaxImagesPerRequest - currentCount
+		if slots < 0 {
+			slots = 0
+		}
+		count := minInt(restoreCount, slots)
+		start := len(historical) - count
+		if start < 0 {
+			start = 0
+		}
+		for _, asset := range historical[start:] {
+			full[asset.ID] = true
+		}
+	}
+	reserve := cfg.VisionImageTokenReserve
+	if reserve <= 0 {
+		reserve = defaultPluginConfig().VisionImageTokenReserve
+	}
+	placeholder := strings.Repeat("x", reserve*3)
+	archivedCount := 0
+	for _, asset := range assets {
+		replacement := placeholder
+		if !full[asset.ID] {
+			if archivedCount == 0 {
+				replacement = archivedVisualMarker(cfg.HistoryAttachmentCompactChars)
+			} else {
+				replacement = "[旧图已归档]"
+			}
+			archivedCount++
+		}
+		if !replaceAsset(root, asset.Path, replacement) {
+			return estimateBodyTokens(body)
+		}
+	}
+	normalized, err := json.Marshal(root)
+	if err != nil {
+		return estimateBodyTokens(body)
+	}
+	return estimateBodyTokens(normalized)
 }
 
 func configure(raw []byte) error {
@@ -226,9 +317,8 @@ func metadata() pluginapi.Metadata {
 		{Name: "vision_backup_model_2", Type: pluginapi.ConfigFieldTypeString, Description: "备用视觉模型 2。"},
 		{Name: "vision_backup_model_3", Type: pluginapi.ConfigFieldTypeString, Description: "备用视觉模型 3。"},
 		{Name: "vision_context_limit", Type: pluginapi.ConfigFieldTypeInteger, Description: "兼容模式下视觉候选共享的上下文上限。"},
-		{Name: "vision_models", Type: pluginapi.ConfigFieldTypeArray, Description: "高级视觉链：model、context_limit、context_budget、timeout_seconds、max_output_tokens、enabled。"},
+		{Name: "vision_models", Type: pluginapi.ConfigFieldTypeArray, Description: "高级视觉链：model、context_limit、context_budget、timeout_seconds、enabled。"},
 		{Name: "vision_input_token_budget", Type: pluginapi.ConfigFieldTypeInteger, Description: "视觉请求仅携带当前问题附近文字的最大预算。"},
-		{Name: "vision_output_tokens", Type: pluginapi.ConfigFieldTypeInteger, Description: "视觉识别输出上限。"},
 		{Name: "vision_timeout_seconds", Type: pluginapi.ConfigFieldTypeInteger, Description: "视觉流建立后、识别阶段的可取消超时时间。"},
 		{Name: "vision_cancel_grace_seconds", Type: pluginapi.ConfigFieldTypeInteger, Description: "调用 stream_close 后等待 Host 确认流已结束的最大秒数；未确认时不会启动备用模型。"},
 		{Name: "cache_ttl_seconds", Type: pluginapi.ConfigFieldTypeInteger, Description: "视觉记忆和历史摘要的持久缓存时长。"},
@@ -438,14 +528,14 @@ func describeImage(cfg runtimeConfig, callbackID string, asset visualAsset, cont
 				cfg.events.stage(event, "视觉候选跳过", "跳过", candidate.Model, "该候选模型已在配置中停用。", time.Now())
 				continue
 			}
-			projectedInput := estimateTokens(contextText) + cfg.VisionImageTokenReserve
-			if projectedInput > candidate.ContextBudget || projectedInput+candidate.MaxOutputTokens > candidate.ContextLimit {
+			projectedInput := estimateTokens(cfg.VisionPrompt) + estimateTokens(contextText) + cfg.VisionImageTokenReserve
+			if projectedInput > candidate.ContextBudget || projectedInput > candidate.ContextLimit {
 				lastErr = fmt.Errorf("vision model %s skipped: projected context exceeds %d", candidate.Model, candidate.ContextLimit)
 				cfg.events.stage(event, "视觉上下文预检", "跳过", candidate.Model, fmt.Sprintf("预测输入 %d token，超过工作预算 %d 或总上限 %d，未发送请求。", projectedInput, candidate.ContextBudget, candidate.ContextLimit), time.Now())
 				continue
 			}
 			candidateStarted := time.Now()
-			request := makeVisionRequest(candidate.Model, cfg.VisionPrompt, contextText, asset.URL, candidate.MaxOutputTokens)
+			request := makeVisionRequest(candidate.Model, cfg.VisionPrompt, contextText, asset.URL)
 			cfg.events.stage(event, "视觉候选调用", "进行中", candidate.Model, fmt.Sprintf("启动 CPA Host 视觉流；取得 stream ID 后启用 %d 秒可取消预算，取消确认最多等待 %d 秒。", candidate.TimeoutSeconds, cfg.VisionCancelGraceSeconds), candidateStarted)
 			description, err := hostExecuteVisionStreamWithTimeout(callbackID, lowThinkingModel(candidate.Model), request, candidate.TimeoutSeconds, cfg.VisionCancelGraceSeconds)
 			if err != nil {
@@ -493,6 +583,11 @@ func executeTextFallback(callbackID string, cfg runtimeConfig, body []byte, prot
 		started := time.Now()
 		response, err := hostExecuteProtocol(callbackID, model, body, false, protocol)
 		if err == nil {
+			if reason := responseTruncationReason(response.Body); reason != "" {
+				err = fmt.Errorf("text model %s returned truncated output (%s)", model, reason)
+			}
+		}
+		if err == nil {
 			return response, model, nil
 		}
 		lastErr = err
@@ -523,6 +618,9 @@ func hostExecuteProtocol(callbackID, model string, body []byte, stream bool, pro
 	}
 	if response.StatusCode >= 400 {
 		return response, fmt.Errorf("upstream model %s returned HTTP %d", model, response.StatusCode)
+	}
+	if !stream && !hasDeliverableModelResponse(response.Body) {
+		return response, fmt.Errorf("upstream model %s returned HTTP %d without deliverable output", model, response.StatusCode)
 	}
 	return response, nil
 }
@@ -581,7 +679,11 @@ func forwardTextFallbackStream(streamID, callbackID string, cfg runtimeConfig, b
 }
 
 func forwardPrimaryStream(streamID, callbackID, model string, body []byte, protocol string) (bool, error) {
-	raw, err := callHost(pluginabi.MethodHostModelExecuteStream, makeHostModelRequest(callbackID, protocol, model, body, true))
+	return forwardPrimaryStreamWithHost(streamID, callbackID, model, body, protocol, callHost)
+}
+
+func forwardPrimaryStreamWithHost(streamID, callbackID, model string, body []byte, protocol string, invoke hostCallFunc) (bool, error) {
+	raw, err := invoke(pluginabi.MethodHostModelExecuteStream, makeHostModelRequest(callbackID, protocol, model, body, true))
 	if err != nil {
 		return false, err
 	}
@@ -596,11 +698,13 @@ func forwardPrimaryStream(streamID, callbackID, model string, body []byte, proto
 		return false, fmt.Errorf("text model %s returned no stream id", model)
 	}
 	defer func() {
-		_, _ = callHost(pluginabi.MethodHostModelStreamClose, pluginapi.HostModelStreamCloseRequest{StreamID: started.StreamID})
+		_, _ = invoke(pluginabi.MethodHostModelStreamClose, pluginapi.HostModelStreamCloseRequest{StreamID: started.StreamID})
 	}()
 	emitted := false
+	gate := textStreamOutputGate{}
+	termination := streamTerminationTracker{}
 	for {
-		chunkRaw, err := callHost(pluginabi.MethodHostModelStreamRead, pluginapi.HostModelStreamReadRequest{StreamID: started.StreamID})
+		chunkRaw, err := invoke(pluginabi.MethodHostModelStreamRead, pluginapi.HostModelStreamReadRequest{StreamID: started.StreamID})
 		if err != nil {
 			return emitted, err
 		}
@@ -612,15 +716,274 @@ func forwardPrimaryStream(streamID, callbackID, model string, body []byte, proto
 			return emitted, fmt.Errorf("text stream error: %s", chunk.Error)
 		}
 		if len(chunk.Payload) > 0 {
-			if _, err = callHost(pluginabi.MethodHostStreamEmit, streamEmitRequest{StreamID: streamID, Payload: chunk.Payload}); err != nil {
-				return emitted, err
+			truncationReason := termination.add(chunk.Payload)
+			if truncationReason != "" && !emitted {
+				return false, fmt.Errorf("text model %s returned truncated output (%s)", model, truncationReason)
 			}
-			emitted = true
+			if emitted {
+				if _, err = invoke(pluginabi.MethodHostStreamEmit, streamEmitRequest{StreamID: streamID, Payload: chunk.Payload}); err != nil {
+					return emitted, err
+				}
+				if truncationReason != "" {
+					return true, fmt.Errorf("text model %s returned truncated output (%s)", model, truncationReason)
+				}
+			} else {
+				ready, buffered, gateErr := gate.add(chunk.Payload)
+				if gateErr != nil {
+					return false, gateErr
+				}
+				if ready {
+					for _, payload := range buffered {
+						if _, err = invoke(pluginabi.MethodHostStreamEmit, streamEmitRequest{StreamID: streamID, Payload: payload}); err != nil {
+							return emitted, err
+						}
+						emitted = true
+					}
+				}
+			}
 		}
 		if chunk.Done {
+			if !emitted {
+				return false, fmt.Errorf("text model %s completed without deliverable output", model)
+			}
 			return emitted, nil
 		}
 	}
+}
+
+type streamTerminationTracker struct {
+	pending string
+	reason  string
+}
+
+func (t *streamTerminationTracker) add(payload []byte) string {
+	if t.reason != "" {
+		return t.reason
+	}
+	t.pending += string(payload)
+	for {
+		index := strings.IndexByte(t.pending, '\n')
+		if index < 0 {
+			break
+		}
+		line := strings.TrimSuffix(t.pending[:index], "\r")
+		t.pending = t.pending[index+1:]
+		if reason := streamLineTruncationReason(line); reason != "" {
+			t.reason = reason
+			return reason
+		}
+	}
+	if streamLineIsComplete(t.pending) {
+		t.reason = streamLineTruncationReason(t.pending)
+		t.pending = ""
+	}
+	return t.reason
+}
+
+func streamLineTruncationReason(line string) string {
+	line = strings.TrimSpace(strings.TrimSuffix(line, "\r"))
+	if line == "" || line == "[DONE]" || line == "data: [DONE]" || strings.HasPrefix(line, ":") || strings.HasPrefix(line, "event:") {
+		return ""
+	}
+	if strings.HasPrefix(line, "data:") {
+		line = strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+	}
+	return responseTruncationReason([]byte(line))
+}
+
+const maxBufferedTextStreamBytes = 1024 * 1024
+
+type textStreamOutputGate struct {
+	pending  string
+	payloads [][]byte
+	size     int
+}
+
+func (g *textStreamOutputGate) add(payload []byte) (bool, [][]byte, error) {
+	copyPayload := append([]byte(nil), payload...)
+	g.payloads = append(g.payloads, copyPayload)
+	g.size += len(copyPayload)
+	if g.size > maxBufferedTextStreamBytes {
+		return false, nil, fmt.Errorf("text stream exceeded %d buffered metadata bytes before producing deliverable output", maxBufferedTextStreamBytes)
+	}
+	g.pending += string(payload)
+	deliverable := false
+	for {
+		index := strings.IndexByte(g.pending, '\n')
+		if index < 0 {
+			break
+		}
+		line := strings.TrimSuffix(g.pending[:index], "\r")
+		g.pending = g.pending[index+1:]
+		if streamLineHasDeliverableOutput(line) {
+			deliverable = true
+		}
+	}
+	if streamLineIsComplete(g.pending) {
+		if streamLineHasDeliverableOutput(g.pending) {
+			deliverable = true
+		}
+		g.pending = ""
+	}
+	if !deliverable {
+		return false, nil, nil
+	}
+	buffered := g.payloads
+	g.payloads = nil
+	g.size = 0
+	g.pending = ""
+	return true, buffered, nil
+}
+
+func streamLineIsComplete(line string) bool {
+	line = strings.TrimSpace(strings.TrimSuffix(line, "\r"))
+	if line == "" || line == "[DONE]" || line == "data: [DONE]" {
+		return true
+	}
+	if strings.HasPrefix(line, "event:") && !strings.Contains(line, "{") {
+		return true
+	}
+	if strings.HasPrefix(line, "data:") {
+		line = strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+	}
+	return json.Valid([]byte(line))
+}
+
+func streamLineHasDeliverableOutput(line string) bool {
+	line = strings.TrimSpace(strings.TrimSuffix(line, "\r"))
+	if line == "" || line == "[DONE]" || line == "data: [DONE]" || strings.HasPrefix(line, ":") || strings.HasPrefix(line, "event:") {
+		return false
+	}
+	if strings.HasPrefix(line, "data:") {
+		line = strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+	}
+	var root map[string]any
+	if json.Unmarshal([]byte(line), &root) != nil {
+		return false
+	}
+	return streamEventHasDeliverableOutput(root)
+}
+
+func streamEventHasDeliverableOutput(root map[string]any) bool {
+	eventType := strings.ToLower(strings.TrimSpace(stringValue(root["type"])))
+	if eventType == "response.output_text.delta" || eventType == "response.refusal.delta" {
+		return strings.TrimSpace(stringValue(root["delta"])) != ""
+	}
+	if strings.Contains(eventType, "reasoning") || strings.Contains(eventType, "thinking") {
+		return strings.TrimSpace(stringValue(root["delta"])) != ""
+	}
+	if eventType == "response.output_text.done" {
+		return strings.TrimSpace(stringValue(root["text"])) != ""
+	}
+	if strings.Contains(eventType, "function_call") || strings.Contains(eventType, "custom_tool_call") || strings.Contains(eventType, "computer_call") {
+		return true
+	}
+	if eventType == "content_block_start" {
+		if block, ok := root["content_block"].(map[string]any); ok {
+			return outputItemHasDeliverableContent(block)
+		}
+	}
+	if eventType == "content_block_delta" {
+		if delta, ok := root["delta"].(map[string]any); ok {
+			deltaType := strings.ToLower(strings.TrimSpace(stringValue(delta["type"])))
+			if deltaType == "text_delta" {
+				return strings.TrimSpace(stringValue(delta["text"])) != ""
+			}
+			if deltaType == "thinking_delta" {
+				return strings.TrimSpace(stringValue(delta["thinking"])) != ""
+			}
+			return deltaType == "input_json_delta" && strings.TrimSpace(stringValue(delta["partial_json"])) != ""
+		}
+	}
+	if item, ok := root["item"].(map[string]any); ok && outputItemHasDeliverableContent(item) {
+		return true
+	}
+	if choices, ok := root["choices"].([]any); ok {
+		for _, rawChoice := range choices {
+			choice, _ := rawChoice.(map[string]any)
+			if strings.TrimSpace(contentText(choice["text"])) != "" {
+				return true
+			}
+			for _, key := range []string{"delta", "message"} {
+				message, _ := choice[key].(map[string]any)
+				if outputItemHasDeliverableContent(message) {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
+func hasDeliverableModelResponse(raw []byte) bool {
+	if len(bytes.TrimSpace(raw)) == 0 {
+		return false
+	}
+	var root map[string]any
+	if json.Unmarshal(raw, &root) != nil {
+		return false
+	}
+	if strings.TrimSpace(contentText(root["output_text"])) != "" || strings.TrimSpace(contentText(root["completion"])) != "" {
+		return true
+	}
+	if choices, ok := root["choices"].([]any); ok {
+		for _, rawChoice := range choices {
+			choice, _ := rawChoice.(map[string]any)
+			if strings.TrimSpace(contentText(choice["text"])) != "" {
+				return true
+			}
+			if message, ok := choice["message"].(map[string]any); ok && outputItemHasDeliverableContent(message) {
+				return true
+			}
+		}
+	}
+	for _, field := range []string{"output", "content"} {
+		if items, ok := root[field].([]any); ok {
+			for _, rawItem := range items {
+				item, _ := rawItem.(map[string]any)
+				if outputItemHasDeliverableContent(item) {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
+func outputItemHasDeliverableContent(item map[string]any) bool {
+	if len(item) == 0 {
+		return false
+	}
+	for _, key := range []string{"content", "text", "refusal", "reasoning_content", "reasoning", "thinking"} {
+		if strings.TrimSpace(contentText(item[key])) != "" {
+			return true
+		}
+	}
+	for _, key := range []string{"tool_calls", "function_call"} {
+		switch value := item[key].(type) {
+		case []any:
+			if len(value) > 0 {
+				return true
+			}
+		case map[string]any:
+			if len(value) > 0 {
+				return true
+			}
+		}
+	}
+	itemType := strings.ToLower(strings.TrimSpace(stringValue(item["type"])))
+	if itemType == "tool_use" || strings.HasSuffix(itemType, "_call") {
+		return true
+	}
+	if content, ok := item["content"].([]any); ok {
+		for _, rawPart := range content {
+			part, _ := rawPart.(map[string]any)
+			if outputItemHasDeliverableContent(part) {
+				return true
+			}
+		}
+	}
+	return false
 }
 func closePluginStream(streamID string, err error) {
 	message := ""
