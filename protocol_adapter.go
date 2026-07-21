@@ -251,21 +251,3 @@ func (a protocolAdapter) decodeImageBlock(item map[string]any, typ string) (stri
 		return "", fmt.Errorf("unsupported Claude image source type %q", sourceType)
 	}
 }
-
-func (a protocolAdapter) removeRedundantImageTools(root map[string]any) bool {
-	removed := filterNamedToolList(root, "tools", "view_image")
-	if a.supportsAdditionalTools {
-		if input, ok := root["input"].([]any); ok {
-			for _, item := range input {
-				obj, _ := item.(map[string]any)
-				if strings.EqualFold(strings.TrimSpace(stringValue(obj["type"])), "additional_tools") {
-					removed = filterNamedToolList(obj, "tools", "view_image") || removed
-				}
-			}
-		}
-	}
-	if cleanToolChoice(root, "view_image") {
-		removed = true
-	}
-	return removed
-}
