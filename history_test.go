@@ -149,17 +149,19 @@ func TestTextContextPrecheckEventIsRecordedBelowCompressionThreshold(t *testing.
 	assertEventStage(t, cfg.events, event.ID, "文本上下文预检")
 }
 
-func TestFinalTextBodyRemovesOnlyTopLevelMaxTokens(t *testing.T) {
+func TestFinalTextBodyRemovesOnlyTopLevelOutputLimits(t *testing.T) {
 	cfg := testRuntime()
 	defer cfg.cache.close()
 	event := cfg.events.begin("combo", "glm", false)
 	raw := []byte(`{
 		"model":"glm-5.2-vision-combo",
 		"max_tokens":50,
+		"max_output_tokens":64,
+		"max_completion_tokens":75,
 		"reasoning_effort":"xhigh",
 		"thinking":{"type":"enabled"},
 		"messages":[{"role":"user","content":"solve"}],
-		"tools":[{"type":"function","function":{"name":"run","parameters":{"type":"object","properties":{"max_tokens":{"type":"integer"}}}}}]
+		"tools":[{"type":"function","function":{"name":"run","parameters":{"type":"object","properties":{"max_tokens":{"type":"integer"},"max_output_tokens":{"type":"integer"},"max_completion_tokens":{"type":"integer"}}}}}]
 	}`)
 
 	got, err := prepareFinalTextBody(raw, cfg, "", event)
@@ -170,8 +172,10 @@ func TestFinalTextBodyRemovesOnlyTopLevelMaxTokens(t *testing.T) {
 	if err := json.Unmarshal(got, &root); err != nil {
 		t.Fatal(err)
 	}
-	if _, exists := root["max_tokens"]; exists {
-		t.Fatalf("top-level max_tokens was retained: %s", got)
+	for _, key := range []string{"max_tokens", "max_output_tokens", "max_completion_tokens"} {
+		if _, exists := root[key]; exists {
+			t.Fatalf("top-level %s was retained: %s", key, got)
+		}
 	}
 	if root["reasoning_effort"] != "xhigh" {
 		t.Fatalf("reasoning_effort changed: %s", got)
@@ -180,22 +184,59 @@ func TestFinalTextBodyRemovesOnlyTopLevelMaxTokens(t *testing.T) {
 	if thinking["type"] != "enabled" {
 		t.Fatalf("thinking config changed: %s", got)
 	}
-	if !strings.Contains(string(got), `"properties":{"max_tokens":{"type":"integer"}}`) {
-		t.Fatalf("nested tool schema was changed: %s", got)
+	for _, nested := range []string{`"max_tokens":{"type":"integer"}`, `"max_output_tokens":{"type":"integer"}`, `"max_completion_tokens":{"type":"integer"}`} {
+		if !strings.Contains(string(got), nested) {
+			t.Fatalf("nested tool schema field %s was changed: %s", nested, got)
+		}
 	}
 	assertEventStage(t, cfg.events, event.ID, "移除最终输出上限")
 }
 
-func TestFinalTextBodyWithoutMaxTokensRemainsByteIdentical(t *testing.T) {
+func TestFinalTextBodyWithoutTopLevelOutputLimitsRemainsByteIdentical(t *testing.T) {
 	cfg := testRuntime()
 	defer cfg.cache.close()
-	raw := []byte(`{ "model": "glm-5.2-vision-combo", "reasoning_effort": "low", "messages": [{"role":"user","content":"hello"}] }`)
+	raw := []byte(`{ "model": "glm-5.2-vision-combo", "reasoning_effort": "low", "messages": [{"role":"user","content":"hello"}], "tools":[{"parameters":{"properties":{"max_output_tokens":{"type":"integer"}}}}] }`)
 	got, err := prepareFinalTextBody(raw, cfg, "", cfg.events.begin("combo", "glm", false))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if string(got) != string(raw) {
-		t.Fatalf("request without max_tokens changed:\nwant=%s\ngot=%s", raw, got)
+		t.Fatalf("request without top-level output limits changed:\nwant=%s\ngot=%s", raw, got)
+	}
+}
+
+func TestProtocolFinalTextBodiesRemoveClientOutputLimits(t *testing.T) {
+	tests := []struct {
+		name     string
+		protocol string
+		limitKey string
+		raw      string
+	}{
+		{name: "OpenAI Chat max_tokens", protocol: "openai", limitKey: "max_tokens", raw: `{"model":"combo","max_tokens":64,"messages":[{"role":"user","content":"hello"}],"metadata":{"trace":"keep-me"}}`},
+		{name: "OpenAI Chat max_completion_tokens", protocol: "openai", limitKey: "max_completion_tokens", raw: `{"model":"combo","max_completion_tokens":64,"messages":[{"role":"user","content":"hello"}],"metadata":{"trace":"keep-me"}}`},
+		{name: "OpenAI Responses", protocol: "openai-response", limitKey: "max_output_tokens", raw: `{"model":"combo","max_output_tokens":64,"input":[{"role":"user","content":[{"type":"input_text","text":"hello"}]}],"metadata":{"trace":"keep-me"}}`},
+		{name: "Anthropic Messages", protocol: "claude", limitKey: "max_tokens", raw: `{"model":"combo","max_tokens":64,"messages":[{"role":"user","content":[{"type":"text","text":"hello"}]}],"metadata":{"trace":"keep-me"}}`},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			cfg := testRuntime()
+			defer cfg.cache.close()
+			got, err := prepareTextHostBody([]byte(test.raw), test.protocol, cfg, "", cfg.events.begin("combo", "glm", true))
+			if err != nil {
+				t.Fatal(err)
+			}
+			var root map[string]any
+			if err := json.Unmarshal(got, &root); err != nil {
+				t.Fatal(err)
+			}
+			if _, exists := root[test.limitKey]; exists {
+				t.Fatalf("%s retained %s: %s", test.protocol, test.limitKey, got)
+			}
+			metadata, _ := root["metadata"].(map[string]any)
+			if metadata["trace"] != "keep-me" {
+				t.Fatalf("%s metadata changed: %s", test.protocol, got)
+			}
+		})
 	}
 }
 

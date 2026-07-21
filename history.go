@@ -26,12 +26,12 @@ func prepareFinalTextBody(raw []byte, cfg runtimeConfig, callbackID string, even
 		cfg.events.stage(event, "旧工具轨迹归档", "完成", "本地确定性处理", detail, compactionStarted)
 	}
 	raw = compacted
-	raw, removedMaxTokens, err := removeFinalTextMaxTokens(raw)
+	raw, removedOutputLimits, err := removeFinalTextOutputLimits(raw)
 	if err != nil {
 		return nil, err
 	}
-	if removedMaxTokens {
-		cfg.events.stage(event, "移除最终输出上限", "完成", cfg.PrimaryModel, "已移除客户端顶层 max_tokens，让最终文本模型自然结束；客户端思考配置和视觉子请求的 low 思考策略保持不变。", time.Now())
+	if len(removedOutputLimits) > 0 {
+		cfg.events.stage(event, "移除最终输出上限", "完成", cfg.PrimaryModel, "已移除客户端顶层 "+strings.Join(removedOutputLimits, "、")+"，让最终文本模型自然结束；客户端思考配置和视觉子请求的 low 思考策略保持不变。", time.Now())
 	}
 	initialTokens := estimateBodyTokens(raw)
 	cfg.events.stage(event, "文本上下文预检", "完成", cfg.PrimaryModel, fmt.Sprintf("附件与旧工具轨迹处理后请求约 %d token；自动压缩阈值 %d，主模型工作预算 %d。", initialTokens, cfg.AutoCompressionThresholdTokens, cfg.PrimaryContextBudgetTokens), time.Now())
@@ -111,23 +111,37 @@ func prepareFinalTextBody(raw []byte, cfg runtimeConfig, callbackID string, even
 	return encoded, nil
 }
 
-func removeFinalTextMaxTokens(raw []byte) ([]byte, bool, error) {
-	if !bytes.Contains(raw, []byte(`"max_tokens"`)) {
-		return raw, false, nil
+func removeFinalTextOutputLimits(raw []byte) ([]byte, []string, error) {
+	limitKeys := []string{"max_tokens", "max_output_tokens", "max_completion_tokens"}
+	mayContainLimit := false
+	for _, key := range limitKeys {
+		if bytes.Contains(raw, []byte(`"`+key+`"`)) {
+			mayContainLimit = true
+			break
+		}
+	}
+	if !mayContainLimit {
+		return raw, nil, nil
 	}
 	var root map[string]json.RawMessage
 	if err := json.Unmarshal(raw, &root); err != nil {
-		return nil, false, fmt.Errorf("cannot remove final text max_tokens from invalid request JSON: %w", err)
+		return nil, nil, fmt.Errorf("cannot remove final text output limits from invalid request JSON: %w", err)
 	}
-	if _, exists := root["max_tokens"]; !exists {
-		return raw, false, nil
+	removed := make([]string, 0, len(limitKeys))
+	for _, key := range limitKeys {
+		if _, exists := root[key]; exists {
+			delete(root, key)
+			removed = append(removed, key)
+		}
 	}
-	delete(root, "max_tokens")
+	if len(removed) == 0 {
+		return raw, nil, nil
+	}
 	encoded, err := json.Marshal(root)
 	if err != nil {
-		return nil, false, fmt.Errorf("cannot encode final text request without max_tokens: %w", err)
+		return nil, nil, fmt.Errorf("cannot encode final text request without output limits: %w", err)
 	}
-	return encoded, true, nil
+	return encoded, removed, nil
 }
 
 func conversationField(root map[string]any) (string, []any, bool) {
