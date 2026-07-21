@@ -137,8 +137,16 @@ func TestProcessedImagesRemoveOnlyTheViewImageTool(t *testing.T) {
 			if err := json.Unmarshal([]byte(test.raw), &root); err != nil {
 				t.Fatal(err)
 			}
-			asset := collectVisualAssets(root)[0]
-			context := trimToTokens(nearbyUserTask(root, asset), runtime.VisionInputTokenBudget)
+			assets, err := collectVisualAssetsForProtocol(root, test.protocol)
+			if err != nil || len(assets) != 1 {
+				t.Fatalf("assets=%d err=%v", len(assets), err)
+			}
+			adapter, err := adapterForProtocol(test.protocol)
+			if err != nil {
+				t.Fatal(err)
+			}
+			asset := assets[0]
+			context := trimToTokens(nearbyUserTask(root, asset, adapter), runtime.VisionInputTokenBudget)
 			runtime.cache.set(visualCacheKey(runtime, asset, context), "vision", "recognized image", time.Hour)
 			event := runtime.events.begin(runtime.ComboModel, runtime.PrimaryModel, false)
 			body, images, err := preparePrimaryBody([]byte(test.raw), test.protocol, runtime, "", event)

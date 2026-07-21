@@ -341,9 +341,9 @@ func transformRequestWithPlan(raw []byte, protocol string, cfg runtimeConfig, de
 }
 
 func transformRequestWithPlanAndMediaHint(raw []byte, protocol string, cfg runtimeConfig, mediaHint *bool, describe func(visualAsset, string) (string, error), reportPlan func(visualTransformPlan)) ([]byte, int, error) {
-	protocol = normalizeProtocol(protocol)
-	if !isSupportedProtocol(protocol) {
-		return nil, 0, fmt.Errorf("unsupported request protocol %q", protocol)
+	adapter, err := adapterForProtocol(protocol)
+	if err != nil {
+		return nil, 0, err
 	}
 	mayContainMedia := false
 	if mediaHint != nil {
@@ -360,16 +360,16 @@ func transformRequestWithPlanAndMediaHint(raw []byte, protocol string, cfg runti
 	}
 	var root any
 	if err := json.Unmarshal(raw, &root); err != nil {
-		return nil, 0, fmt.Errorf("invalid %s request JSON: %w", protocol, err)
+		return nil, 0, fmt.Errorf("invalid %s request JSON: %w", adapter.protocol, err)
 	}
-	assets, mediaIssues := inspectVisualMedia(root)
+	assets, mediaIssues := inspectVisualMedia(root, adapter)
 	if len(mediaIssues) > 0 {
 		return nil, len(assets), fmt.Errorf("unsupported media at %s: %s", strings.Join(mediaIssues[0].Path, "/"), mediaIssues[0].Reason)
 	}
 	if len(assets) == 0 {
 		return raw, 0, nil
 	}
-	latestIndex, latestText := latestUserTurn(root)
+	latestIndex, latestText := latestUserTurn(root, adapter)
 	for _, asset := range assets {
 		if asset.ItemIndex > latestIndex {
 			latestIndex = asset.ItemIndex
@@ -411,7 +411,7 @@ func transformRequestWithPlanAndMediaHint(raw []byte, protocol string, cfg runti
 	}
 	for index := range assets {
 		if full[assets[index].ID] {
-			assets[index].Context = trimToTokens(nearbyUserTask(root, assets[index]), cfg.VisionInputTokenBudget)
+			assets[index].Context = trimToTokens(nearbyUserTask(root, assets[index], adapter), cfg.VisionInputTokenBudget)
 		}
 	}
 	if reportPlan != nil {
@@ -464,11 +464,11 @@ func transformRequestWithPlanAndMediaHint(raw []byte, protocol string, cfg runti
 	}
 	if len(toResolve) == 0 {
 		for _, asset := range assets {
-			if !replaceAsset(root, asset.Path, descriptions[asset.ID]) {
+			if !replaceAsset(root, asset.Path, descriptions[asset.ID], adapter) {
 				return nil, len(assets), fmt.Errorf("failed to replace media at %s", strings.Join(asset.Path, "/"))
 			}
 		}
-		return finishVisualTransform(root, len(assets))
+		return finishVisualTransform(root, len(assets), adapter)
 	}
 	workers := minInt(cfg.MaxConcurrentExtractions, len(toResolve))
 	if workers < 1 {
@@ -505,15 +505,15 @@ func transformRequestWithPlanAndMediaHint(raw []byte, protocol string, cfg runti
 		descriptions[item.id] = fullVisualMemory(item.description)
 	}
 	for _, asset := range assets {
-		if !replaceAsset(root, asset.Path, descriptions[asset.ID]) {
+		if !replaceAsset(root, asset.Path, descriptions[asset.ID], adapter) {
 			return nil, len(assets), fmt.Errorf("failed to replace media at %s", strings.Join(asset.Path, "/"))
 		}
 	}
-	return finishVisualTransform(root, len(assets))
+	return finishVisualTransform(root, len(assets), adapter)
 }
 
-func finishVisualTransform(root any, imageCount int) ([]byte, int, error) {
-	remaining, residual := inspectVisualMedia(root)
+func finishVisualTransform(root any, imageCount int, adapter protocolAdapter) ([]byte, int, error) {
+	remaining, residual := inspectVisualMedia(root, adapter)
 	if len(residual) > 0 {
 		return nil, imageCount, fmt.Errorf("media remained after preprocessing at %s: %s", strings.Join(residual[0].Path, "/"), residual[0].Reason)
 	}
@@ -524,24 +524,12 @@ func finishVisualTransform(root any, imageCount int) ([]byte, int, error) {
 	return resultBody, imageCount, err
 }
 
-func removeRedundantImageInspectionTools(raw []byte) ([]byte, bool, error) {
+func removeRedundantImageInspectionTools(raw []byte, adapter protocolAdapter) ([]byte, bool, error) {
 	var root map[string]any
 	if err := json.Unmarshal(raw, &root); err != nil {
 		return nil, false, fmt.Errorf("cannot filter image inspection tools from invalid request JSON: %w", err)
 	}
-	removed := filterNamedToolList(root, "tools", "view_image")
-	if input, ok := root["input"].([]any); ok {
-		for _, item := range input {
-			obj, _ := item.(map[string]any)
-			if strings.EqualFold(strings.TrimSpace(stringValue(obj["type"])), "additional_tools") {
-				removed = filterNamedToolList(obj, "tools", "view_image") || removed
-			}
-		}
-	}
-	if cleanToolChoice(root, "view_image") {
-		removed = true
-	}
-	if !removed {
+	if !adapter.removeRedundantImageTools(root) {
 		return raw, false, nil
 	}
 	encoded, err := json.Marshal(root)
@@ -710,8 +698,24 @@ func archivedVisualMarker(maxChars int) string {
 }
 
 func collectVisualAssets(root any) []visualAsset {
-	assets, _ := inspectVisualMedia(root)
+	adapter, err := detectProtocolAdapterFromRoot(root, false)
+	if err != nil {
+		return nil
+	}
+	assets, _ := inspectVisualMedia(root, adapter)
 	return assets
+}
+
+func collectVisualAssetsForProtocol(root any, protocol string) ([]visualAsset, error) {
+	adapter, err := adapterForProtocol(protocol)
+	if err != nil {
+		return nil, err
+	}
+	assets, issues := inspectVisualMedia(root, adapter)
+	if len(issues) > 0 {
+		return assets, fmt.Errorf("unsupported media at %s: %s", strings.Join(issues[0].Path, "/"), issues[0].Reason)
+	}
+	return assets, nil
 }
 
 type mediaIssue struct {
@@ -719,16 +723,10 @@ type mediaIssue struct {
 	Reason string
 }
 
-func inspectVisualMedia(root any) ([]visualAsset, []mediaIssue) {
+func inspectVisualMedia(root any, adapter protocolAdapter) ([]visualAsset, []mediaIssue) {
 	obj, _ := root.(map[string]any)
-	var items []any
-	base := "messages"
-	if value, ok := obj["messages"].([]any); ok {
-		items = value
-	} else if value, ok := obj["input"].([]any); ok {
-		items = value
-		base = "input"
-	}
+	items := adapter.conversationItems(root)
+	base := adapter.conversationField
 	var assets []visualAsset
 	var issues []mediaIssue
 	for itemIndex, item := range items {
@@ -736,31 +734,47 @@ func inspectVisualMedia(root any) ([]visualAsset, []mediaIssue) {
 		if itemObj, ok := item.(map[string]any); ok {
 			role, _ = itemObj["role"].(string)
 		}
-		walkVisualMedia(item, []string{base, "#" + strconv.Itoa(itemIndex)}, itemIndex, role, &assets, &issues)
+		walkVisualMedia(item, []string{base, "#" + strconv.Itoa(itemIndex)}, itemIndex, role, adapter, &assets, &issues)
 	}
 	keys := make([]string, 0, len(obj))
 	for key := range obj {
-		if key != "messages" && key != "input" {
+		if key != base {
 			keys = append(keys, key)
 		}
 	}
 	sort.Strings(keys)
 	for _, key := range keys {
 		before := len(assets)
-		walkVisualMedia(obj[key], []string{key}, -1, "", &assets, &issues)
+		beforeIssues := len(issues)
+		walkVisualMedia(obj[key], []string{key}, -1, "", adapter, &assets, &issues)
 		for _, asset := range assets[before:] {
-			issues = append(issues, mediaIssue{Path: append([]string(nil), asset.Path...), Reason: "media outside messages/input is not supported"})
+			issues = append(issues, mediaIssue{
+				Path:   append([]string(nil), asset.Path...),
+				Reason: fmt.Sprintf("media outside messages/input is not supported for %s; expected %s", adapter.protocol, base),
+			})
+		}
+		for index := beforeIssues; index < len(issues); index++ {
+			if strings.Contains(issues[index].Reason, "incompatible image block") {
+				issues[index].Reason += fmt.Sprintf("; expected content under %s", base)
+			}
 		}
 	}
 	return assets, issues
 }
 
-func walkVisualMedia(value any, path []string, itemIndex int, role string, assets *[]visualAsset, issues *[]mediaIssue) {
+func walkVisualMedia(value any, path []string, itemIndex int, role string, adapter protocolAdapter, assets *[]visualAsset, issues *[]mediaIssue) {
 	switch current := value.(type) {
 	case map[string]any:
 		typ := strings.ToLower(strings.TrimSpace(stringValue(current["type"])))
 		if isImageBlockType(typ) {
-			rawURL, err := mediaImageURL(current, typ)
+			if !adapter.supportsImageType(typ) {
+				*issues = append(*issues, mediaIssue{
+					Path:   append([]string(nil), path...),
+					Reason: fmt.Sprintf("%s request contains incompatible image block type %q; expected %q", adapter.protocol, typ, adapter.imageBlockType),
+				})
+				return
+			}
+			rawURL, err := adapter.decodeImageBlock(current, typ)
 			if err != nil {
 				*issues = append(*issues, mediaIssue{Path: append([]string(nil), path...), Reason: err.Error()})
 				return
@@ -779,11 +793,11 @@ func walkVisualMedia(value any, path []string, itemIndex int, role string, asset
 		}
 		sort.Strings(keys)
 		for _, key := range keys {
-			walkVisualMedia(current[key], append(path, key), itemIndex, role, assets, issues)
+			walkVisualMedia(current[key], append(path, key), itemIndex, role, adapter, assets, issues)
 		}
 	case []any:
 		for index, child := range current {
-			walkVisualMedia(child, append(path, "#"+strconv.Itoa(index)), itemIndex, role, assets, issues)
+			walkVisualMedia(child, append(path, "#"+strconv.Itoa(index)), itemIndex, role, adapter, assets, issues)
 		}
 	}
 }
@@ -795,46 +809,6 @@ func stringValue(value any) string {
 
 func isImageBlockType(typ string) bool {
 	return typ == "image_url" || typ == "input_image" || typ == "image"
-}
-
-func mediaImageURL(item map[string]any, typ string) (string, error) {
-	if typ != "image" {
-		if raw := imageURL(item); raw != "" {
-			return raw, nil
-		}
-		return "", fmt.Errorf("image block has no supported URL")
-	}
-	if raw := imageURL(item); raw != "" {
-		return raw, nil
-	}
-	source, ok := item["source"].(map[string]any)
-	if !ok {
-		return "", fmt.Errorf("Claude image block has no source")
-	}
-	sourceType := strings.ToLower(strings.TrimSpace(stringValue(source["type"])))
-	switch sourceType {
-	case "base64":
-		mediaType := strings.ToLower(strings.TrimSpace(stringValue(source["media_type"])))
-		if !strings.HasPrefix(mediaType, "image/") {
-			if mediaType == "application/pdf" {
-				return "", fmt.Errorf("PDF attachments are not supported by the image bridge")
-			}
-			return "", fmt.Errorf("unsupported Claude image media type %q", mediaType)
-		}
-		data := strings.TrimSpace(stringValue(source["data"]))
-		if data == "" {
-			return "", fmt.Errorf("Claude base64 image source is empty")
-		}
-		return "data:" + mediaType + ";base64," + data, nil
-	case "url":
-		raw := strings.TrimSpace(stringValue(source["url"]))
-		if raw == "" {
-			return "", fmt.Errorf("Claude URL image source is empty")
-		}
-		return raw, nil
-	default:
-		return "", fmt.Errorf("unsupported Claude image source type %q", sourceType)
-	}
 }
 
 func unsupportedMediaReason(item map[string]any, typ string) string {
@@ -858,8 +832,20 @@ func unsupportedMediaReason(item map[string]any, typ string) string {
 	return ""
 }
 
-func latestUserTurn(root any) (int, string) {
-	items := conversationItems(root)
+func traversalAdapter(root any, provided []protocolAdapter) protocolAdapter {
+	if len(provided) > 0 {
+		return provided[0]
+	}
+	adapter, err := detectProtocolAdapterFromRoot(root, false)
+	if err == nil {
+		return adapter
+	}
+	return protocolAdapters[protocolOpenAIChat]
+}
+
+func latestUserTurn(root any, provided ...protocolAdapter) (int, string) {
+	adapter := traversalAdapter(root, provided)
+	items := adapter.conversationItems(root)
 	for index := len(items) - 1; index >= 0; index-- {
 		item, _ := items[index].(map[string]any)
 		if item["role"] == "user" {
@@ -869,19 +855,13 @@ func latestUserTurn(root any) (int, string) {
 	return -1, ""
 }
 
-func conversationItems(root any) []any {
-	obj, _ := root.(map[string]any)
-	if value, ok := obj["messages"].([]any); ok {
-		return value
-	}
-	if value, ok := obj["input"].([]any); ok {
-		return value
-	}
-	return nil
+func conversationItems(root any, provided ...protocolAdapter) []any {
+	return traversalAdapter(root, provided).conversationItems(root)
 }
 
-func nearbyUserTask(root any, asset visualAsset) string {
-	items := conversationItems(root)
+func nearbyUserTask(root any, asset visualAsset, provided ...protocolAdapter) string {
+	adapter := traversalAdapter(root, provided)
+	items := adapter.conversationItems(root)
 	start := asset.ItemIndex
 	if start >= len(items) {
 		start = len(items) - 1
@@ -1045,17 +1025,7 @@ func validateArchivedAssetMetadata(raw string, cfg runtimeConfig) error {
 	return nil
 }
 
-func replacementTextPart(path []string, description string) map[string]any {
-	partType := "text"
-	// Responses API content in top-level input uses input_text/input_image,
-	// while Chat Completions and Claude messages use text/image blocks.
-	if len(path) > 0 && path[0] == "input" {
-		partType = "input_text"
-	}
-	return map[string]any{"type": partType, "text": description}
-}
-
-func replaceAsset(root any, path []string, description string) bool {
+func replaceAsset(root any, path []string, description string, adapter protocolAdapter) bool {
 	if len(path) == 0 {
 		return false
 	}
@@ -1069,7 +1039,7 @@ func replaceAsset(root any, path []string, description string) bool {
 				return false
 			}
 			if last {
-				array[position] = replacementTextPart(path, description)
+				array[position] = adapter.makeTextBlock(description)
 				return true
 			}
 			current = array[position]
@@ -1079,7 +1049,7 @@ func replaceAsset(root any, path []string, description string) bool {
 				return false
 			}
 			if last {
-				obj[step] = replacementTextPart(path, description)
+				obj[step] = adapter.makeTextBlock(description)
 				return true
 			}
 			current = obj[step]

@@ -197,11 +197,15 @@ func estimateExecutorInputTokens(body []byte, cfg runtimeConfig) int {
 	if json.Unmarshal(body, &root) != nil {
 		return estimateBodyTokens(body)
 	}
-	assets := collectVisualAssets(root)
-	if len(assets) == 0 {
+	adapter, err := detectProtocolAdapterFromRoot(root, false)
+	if err != nil {
 		return estimateBodyTokens(body)
 	}
-	latestIndex, latestText := latestUserTurn(root)
+	assets, mediaIssues := inspectVisualMedia(root, adapter)
+	if len(mediaIssues) > 0 || len(assets) == 0 {
+		return estimateBodyTokens(body)
+	}
+	latestIndex, latestText := latestUserTurn(root, adapter)
 	for _, asset := range assets {
 		if asset.ItemIndex > latestIndex {
 			latestIndex = asset.ItemIndex
@@ -252,7 +256,7 @@ func estimateExecutorInputTokens(body []byte, cfg runtimeConfig) int {
 			}
 			archivedCount++
 		}
-		if !replaceAsset(root, asset.Path, replacement) {
+		if !replaceAsset(root, asset.Path, replacement, adapter) {
 			return estimateBodyTokens(body)
 		}
 	}
@@ -372,30 +376,27 @@ func routeModel(raw []byte) ([]byte, error) {
 	requested := strings.TrimSpace(req.RequestedModel)
 	// Route only the single public model name. Legacy aliases are no longer accepted.
 	matched := requested != "" && requested == strings.TrimSpace(cfg.ComboModel)
-	protocol := normalizeProtocol(req.SourceFormat)
-	if !cfg.Enabled || !isSupportedProtocol(protocol) || !matched {
+	if !cfg.Enabled || !matched {
+		return okEnvelope(pluginapi.ModelRouteResponse{Handled: false})
+	}
+	if _, err := resolveProtocolAdapter(req.SourceFormat, "", req.Body); err != nil {
+		// Unsupported or ambiguous protocols must remain available to other
+		// routers instead of turning model discovery into a hard failure.
 		return okEnvelope(pluginapi.ModelRouteResponse{Handled: false})
 	}
 	return okEnvelope(pluginapi.ModelRouteResponse{Handled: true, TargetKind: pluginapi.ModelRouteTargetSelf, Reason: "glm_vision_combo_orchestration"})
 }
 
-func normalizeProtocol(value string) string {
-	return strings.ToLower(strings.TrimSpace(value))
-}
-
-func isSupportedProtocol(value string) bool {
-	return value == "openai" || value == "openai-response" || value == "claude"
-}
-
 func executorProtocol(req rpcExecutorRequest) (string, error) {
-	protocol := normalizeProtocol(req.SourceFormat)
-	if protocol == "" {
-		protocol = normalizeProtocol(req.Format)
+	body := req.OriginalRequest
+	if len(body) == 0 {
+		body = req.Payload
 	}
-	if !isSupportedProtocol(protocol) {
-		return "", fmt.Errorf("unsupported executor protocol %q", protocol)
+	adapter, err := resolveProtocolAdapter(req.SourceFormat, req.Format, body)
+	if err != nil {
+		return "", err
 	}
-	return protocol, nil
+	return adapter.protocol, nil
 }
 
 func execute(raw []byte) ([]byte, error) {
@@ -601,19 +602,18 @@ func preparePrimaryBody(raw []byte, protocol string, cfg runtimeConfig, callback
 	if len(raw) == 0 {
 		return nil, 0, fmt.Errorf("original %s request is missing", protocol)
 	}
-	var mayContainMedia *bool
-	if normalizeProtocol(protocol) == "openai-response" {
-		body, normalized, media, err := normalizeResponsesStringInputWithMedia(raw, protocol)
-		if err != nil {
-			return nil, 0, err
-		}
-		raw = body
-		mayContainMedia = &media
-		if normalized {
-			cfg.events.stage(event, "规范化 Responses 输入", "完成", cfg.PrimaryModel, "字符串 input 已转换为等价的标准 user message 数组；其他请求参数保持不变。", time.Now())
-		}
+	adapter, err := adapterForProtocol(protocol)
+	if err != nil {
+		return nil, 0, err
 	}
-	body, images, err := transformRequestWithPlanAndMediaHint(raw, protocol, cfg, mayContainMedia, func(asset visualAsset, contextText string) (string, error) {
+	body, normalized, mayContainMedia, err := adapter.normalizeRequest(raw)
+	if err != nil {
+		return nil, 0, err
+	}
+	if normalized {
+		cfg.events.stage(event, "规范化 Responses 输入", "完成", cfg.PrimaryModel, "字符串 input 已转换为等价的标准 user message 数组；其他请求参数保持不变。", time.Now())
+	}
+	body, images, err := transformRequestWithPlanAndMediaHint(body, adapter.protocol, cfg, mayContainMedia, func(asset visualAsset, contextText string) (string, error) {
 		return describeImage(cfg, callbackID, asset, contextText, event)
 	}, func(plan visualTransformPlan) {
 		if plan.HistoricalImages == 0 {
@@ -628,7 +628,7 @@ func preparePrimaryBody(raw []byte, protocol string, cfg runtimeConfig, callback
 	if err != nil || images == 0 {
 		return body, images, err
 	}
-	body, removed, err := removeRedundantImageInspectionTools(body)
+	body, removed, err := removeRedundantImageInspectionTools(body, adapter)
 	if err != nil {
 		return nil, images, err
 	}
