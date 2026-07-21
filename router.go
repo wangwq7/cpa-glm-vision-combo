@@ -1045,6 +1045,16 @@ func validateArchivedAssetMetadata(raw string, cfg runtimeConfig) error {
 	return nil
 }
 
+func replacementTextPart(path []string, description string) map[string]any {
+	partType := "text"
+	// Responses API content in top-level input uses input_text/input_image,
+	// while Chat Completions and Claude messages use text/image blocks.
+	if len(path) > 0 && path[0] == "input" {
+		partType = "input_text"
+	}
+	return map[string]any{"type": partType, "text": description}
+}
+
 func replaceAsset(root any, path []string, description string) bool {
 	if len(path) == 0 {
 		return false
@@ -1059,7 +1069,7 @@ func replaceAsset(root any, path []string, description string) bool {
 				return false
 			}
 			if last {
-				array[position] = map[string]any{"type": "text", "text": description}
+				array[position] = replacementTextPart(path, description)
 				return true
 			}
 			current = array[position]
@@ -1069,7 +1079,7 @@ func replaceAsset(root any, path []string, description string) bool {
 				return false
 			}
 			if last {
-				obj[step] = map[string]any{"type": "text", "text": description}
+				obj[step] = replacementTextPart(path, description)
 				return true
 			}
 			current = obj[step]

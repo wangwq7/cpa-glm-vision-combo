@@ -166,6 +166,18 @@ func TestProcessedImagesRemoveOnlyTheViewImageTool(t *testing.T) {
 					}
 				}
 			}
+			if test.protocol == "openai-response" {
+				input, _ := got["input"].([]any)
+				user, _ := input[1].(map[string]any)
+				content, _ := user["content"].([]any)
+				replacement, _ := content[1].(map[string]any)
+				if replacement["type"] != "input_text" || !strings.Contains(stringValue(replacement["text"]), "recognized image") {
+					t.Fatalf("Responses image was not replaced with input_text visual memory: %s", body)
+				}
+				if strings.Contains(string(body), `"type":"input_image"`) {
+					t.Fatalf("Responses image remained after preprocessing: %s", body)
+				}
+			}
 			foundStage := false
 			for _, stored := range runtime.events.snapshot() {
 				if stored.ID != event.ID {
