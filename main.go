@@ -613,9 +613,11 @@ func preparePrimaryBody(raw []byte, protocol string, cfg runtimeConfig, callback
 			cfg.events.stage(event, "规范化 Responses 输入", "完成", cfg.PrimaryModel, "字符串 input 已转换为等价的标准 user message 数组；其他请求参数保持不变。", time.Now())
 		}
 	}
+	processedImagesForTurn := 0
 	body, images, err := transformRequestWithPlanAndMediaHint(raw, protocol, cfg, mayContainMedia, func(asset visualAsset, contextText string) (string, error) {
 		return describeImage(cfg, callbackID, asset, contextText, event)
 	}, func(plan visualTransformPlan) {
+		processedImagesForTurn = plan.CurrentImages + plan.RestoredImages
 		if plan.HistoricalImages == 0 {
 			return
 		}
@@ -625,16 +627,22 @@ func preparePrimaryBody(raw []byte, protocol string, cfg runtimeConfig, callback
 		}
 		cfg.events.stage(event, "历史图片处理", "完成", cfg.PrimaryModel, detail, time.Now())
 	})
-	if err != nil || images == 0 {
+	if err != nil || images == 0 || processedImagesForTurn == 0 {
 		return body, images, err
 	}
-	body, removed, err := removeRedundantImageInspectionTools(body)
+	body, toolPolicy, err := applyProcessedImageToolPolicy(body)
 	if err != nil {
 		return nil, images, err
 	}
-	if removed {
-		cfg.events.stage(event, "屏蔽重复看图工具", "完成", cfg.PrimaryModel, "图片已转换为视觉记忆；已从本轮文本模型工具列表移除 view_image，其他工具保持不变。", time.Now())
+	detail := "本轮相关图片已转换为视觉记忆，并加入不得仅为重复读取这些图片而调用客户端工具的约束。"
+	if toolPolicy.RemovedViewImage {
+		detail += " 已移除 view_image。"
 	}
+	if toolPolicy.ConstrainedTools > 0 {
+		detail += fmt.Sprintf(" 已为 %d 个 shell_command/js 工具定义补充同一约束。", toolPolicy.ConstrainedTools)
+	}
+	detail += " 其他工具仍可用于用户明确要求的代码、文件、系统、外部资源或图片处理操作。"
+	cfg.events.stage(event, "约束重复看图工具", "完成", cfg.PrimaryModel, detail, time.Now())
 	return body, images, nil
 }
 func describeImage(cfg runtimeConfig, callbackID string, asset visualAsset, contextText string, event *comboEvent) (string, error) {
