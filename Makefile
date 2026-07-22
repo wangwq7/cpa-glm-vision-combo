@@ -1,5 +1,5 @@
 PLUGIN := glm-vision-combo
-VERSION ?= 0.5.1
+VERSION ?= 0.7
 
 test:
 	go test ./...

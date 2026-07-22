@@ -56,13 +56,26 @@ func prepareFinalTextBody(raw []byte, cfg runtimeConfig, callbackID string, even
 	}
 	checkpointSummary, checkpointIndex, checkpointFound := cfg.cache.getLast(checkpointKeys)
 	checkpointPrefix := checkpointIndex + 1
+	boundaries := historyCompressionBoundaries(compressible)
+	if checkpointFound && !historyBoundarySafe(compressible, checkpointPrefix) {
+		checkpointSummary = ""
+		checkpointIndex = -1
+		checkpointPrefix = 0
+		checkpointFound = false
+	}
+	if checkpointFound && !containsHistoryBoundary(boundaries, checkpointPrefix) {
+		checkpointSummary = ""
+		checkpointIndex = -1
+		checkpointPrefix = 0
+		checkpointFound = false
+	}
 	if checkpointFound {
 		rebuilt, err := compressedHistoryBody(root, field, persistent, checkpointSummary, compressible[checkpointPrefix:])
 		if err != nil {
 			return nil, err
 		}
 		if estimateBodyTokens(rebuilt) <= cfg.PrimaryContextBudgetTokens {
-			cfg.events.stage(event, "复用历史压缩检查点", "完成", "缓存", fmt.Sprintf("复用 %d 条历史消息的持久摘要，仅保留其后的 %d 条新增/近期消息；未调用压缩模型。", checkpointPrefix, len(compressible)-checkpointPrefix), time.Now())
+			cfg.events.stage(event, "复用历史压缩检查点", "完成", "缓存", "复用持久摘要；仅保留其后的完整语义轮次和工具事务，工具调用与结果未跨摘要边界；未调用压缩模型。", time.Now())
 			return rebuilt, nil
 		}
 	}
@@ -96,7 +109,7 @@ func prepareFinalTextBody(raw []byte, cfg runtimeConfig, callbackID string, even
 	if estimateBodyTokens(encoded) > cfg.PrimaryContextBudgetTokens {
 		return nil, fmt.Errorf("conversation still exceeds the primary working budget (%d tokens) after one checkpoint update", cfg.PrimaryContextBudgetTokens)
 	}
-	detail := fmt.Sprintf("历史前缀 %d 条已生成可复用摘要；保留最近 %d 条原文。后续追加少量对话将直接复用，不再逐轮重新压缩。", prefixCount, len(recent))
+	detail := fmt.Sprintf("历史前缀 %d 条已按完整语义边界生成可复用摘要；保留最近语义轮次和完整工具事务共 %d 条原文。后续追加少量对话将直接复用，不再逐轮重新压缩。", prefixCount, len(recent))
 	cfg.events.stage(event, stageName, "完成", compressionModelName(cfg), detail, started)
 	return encoded, nil
 }
@@ -160,15 +173,19 @@ func splitPersistentHistory(items []any) ([]any, []any) {
 }
 
 func chooseHistoryCheckpointPrefix(root map[string]any, field string, persistent, compressible []any, minimumPrefix int, cfg runtimeConfig) (int, bool) {
-	maxKeep := minInt(cfg.AutoCompressionKeepRecentTurns, len(compressible)-1)
+	boundaries := historyCompressionBoundaries(compressible)
+	maxKeep := minInt(cfg.AutoCompressionKeepRecentTurns, len(boundaries)-1)
 	reserveChars := cfg.AutoCompressionTargetTokens * 4
 	if reserveChars < 256 {
 		reserveChars = 256
 	}
 	reservedSummary := strings.Repeat("x", reserveChars)
 	for keep := maxKeep; keep >= 1; keep-- {
-		prefixCount := len(compressible) - keep
-		if prefixCount <= minimumPrefix {
+		// boundaries contains the start of the retained suffixes in semantic
+		// order, with 0 as its first element and the final safe end as its
+		// last. Keeping N units starts N segments before that final end.
+		prefixCount := boundaries[len(boundaries)-1-keep]
+		if prefixCount <= minimumPrefix || !historyBoundarySafe(compressible, prefixCount) {
 			continue
 		}
 		candidate, err := compressedHistoryBody(root, field, persistent, reservedSummary, compressible[prefixCount:])
@@ -196,7 +213,7 @@ func compressedHistoryBody(root map[string]any, field string, persistent []any, 
 func historyCheckpointKeys(field string, items []any, cfg runtimeConfig) ([]string, error) {
 	models := uniqueModels(append([]string{compressionModelName(cfg)}, cfg.TextFallbackModels...))
 	digest := sha256.New()
-	digest.Write([]byte("history-checkpoint-v2\x00" + field + "\x00" + strings.Join(models, "\x00") + "\x00" + fmt.Sprint(cfg.AutoCompressionTargetTokens) + "\x00"))
+	digest.Write([]byte("history-checkpoint-v3\x00" + field + "\x00" + strings.Join(models, "\x00") + "\x00" + fmt.Sprint(cfg.AutoCompressionTargetTokens) + "\x00"))
 	keys := make([]string, 0, len(items))
 	var length [8]byte
 	for _, item := range items {
@@ -305,7 +322,7 @@ func splitText(text string, maxChars int) []string {
 
 func compressHistoryPiece(history string, target int, cfg runtimeConfig, callbackID string, event *comboEvent) (string, error) {
 	models := uniqueModels(append([]string{compressionModelName(cfg)}, cfg.TextFallbackModels...))
-	hash := sha256.Sum256([]byte("history-v2\x00" + strings.Join(models, "\x00") + "\x00" + fmt.Sprint(target) + "\x00" + history))
+	hash := sha256.Sum256([]byte("history-v3\x00" + strings.Join(models, "\x00") + "\x00" + fmt.Sprint(target) + "\x00" + history))
 	key := "history:" + hex.EncodeToString(hash[:])
 	if cached, ok := cfg.cache.get(key); ok {
 		cfg.events.stage(event, "读取压缩摘要缓存", "完成", "缓存", "相同历史片段命中缓存，未再次调用压缩模型。", time.Now())
