@@ -339,9 +339,9 @@ func metadata() pluginapi.Metadata {
 		{Name: "history_attachment_compact_chars", Type: pluginapi.ConfigFieldTypeInteger, Description: "无关轮中的历史图片归档标记最大字符数。"},
 		{Name: "history_attachment_restore_max_attachments", Type: pluginapi.ConfigFieldTypeInteger, Description: "明确引用图片时最多恢复的历史图片数。"},
 		{Name: "auto_compression_enabled", Type: pluginapi.ConfigFieldTypeBoolean, Description: "达到阈值后建立可复用的历史摘要检查点。"},
-		{Name: "auto_compression_threshold_tokens", Type: pluginapi.ConfigFieldTypeInteger, Description: "自动压缩触发阈值。"},
+		{Name: "auto_compression_threshold_tokens", Type: pluginapi.ConfigFieldTypeInteger, Description: "自动压缩触发阈值；1M 上限、900K 工作预算时推荐 820000。"},
 		{Name: "auto_compression_target_tokens", Type: pluginapi.ConfigFieldTypeInteger, Description: "用于规划历史摘要检查点大小；不会作为模型输出 token 上限下发。"},
-		{Name: "auto_compression_keep_recent_turns", Type: pluginapi.ConfigFieldTypeInteger, Description: "创建或更新检查点时优先保留原文的最近轮数。"},
+		{Name: "auto_compression_keep_recent_turns", Type: pluginapi.ConfigFieldTypeInteger, Description: "创建或更新检查点时优先保留原文的最近语义单元数量；完整工具事务不会拆分。"},
 		{Name: "auto_compression_model", Type: pluginapi.ConfigFieldTypeString, Description: "压缩模型；留空使用首选文本模型。"},
 	}}
 }

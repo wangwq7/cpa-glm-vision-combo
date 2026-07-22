@@ -91,8 +91,8 @@ plugins:
       combo_model: glm-5.2-vision-combo
 
       primary_model: glm-5.2
-      primary_context_tokens: 1048576
-      primary_context_budget_tokens: 930000
+      primary_context_tokens: 1000000
+      primary_context_budget_tokens: 900000
       # 文本备用链：不要与下方视觉模型重复
       text_fallback_models:
         - gpt-5.5
@@ -114,10 +114,11 @@ plugins:
       max_concurrent_extractions: 2
 
       auto_compression_enabled: true
-      auto_compression_threshold_tokens: 720000
+      auto_compression_threshold_tokens: 820000
       auto_compression_target_tokens: 12000
       auto_compression_keep_recent_turns: 8
       auto_compression_model: ""
+      # v0.7 仅在完整语义轮次和工具事务边界压缩；820K 到 900K 保留约 80K 安全余量
 
       cache_ttl_seconds: 259200
       cache_max_entries: 2000
@@ -140,8 +141,8 @@ plugins:
 | --- | --- | --- |
 | `combo_model` | 对客户端暴露的**唯一**虚拟模型名 | 默认 `glm-5.2-vision-combo` |
 | `primary_model` | 最终回答的首选文本模型 | 使用长上下文、推理稳定的模型 |
-| `primary_context_tokens` | 文本模型理论上下文上限 | GLM-5.2 为 1M 时填 `1048576` |
-| `primary_context_budget_tokens` | 实际工作安全线 | 必须低于理论上限，预留输出和协议开销 |
+| `primary_context_tokens` | 文本模型理论上下文上限 | 当前 GLM-5.2 配置填 `1000000` |
+| `primary_context_budget_tokens` | 实际工作安全线 | 1M 上限推荐 `900000`，预留输出和协议开销 |
 | `text_fallback_models` | 文本模型首包前失败后的备用链 | 可留空；**禁止**与视觉链模型重复 |
 | `vision_primary_model` | 第一视觉模型 | 优先低延迟、OCR 稳定的模型 |
 | `vision_backup_model_1..3` | 顺序视觉备用链 | 可留空；最多四个视觉候选；**禁止**与文本链重复 |
@@ -153,8 +154,8 @@ plugins:
 | `history_attachment_compact_chars` | 无关轮的旧图归档标记最大长度 | 默认值可保留；标记本身为固定短文本 |
 | `history_attachment_restore_max_attachments` | 追问旧图时最多恢复数量 | 推荐 1–2，避免上下文突然膨胀 |
 | `max_concurrent_extractions` | 多图识别并发数 | 推荐 1–2；提高会增加瞬时请求和费用 |
-| `auto_compression_threshold_tokens` | 自动压缩触发线 | 必须低于主模型工作预算 |
-| `auto_compression_target_tokens` | 历史摘要目标大小 | 推荐 8K–16K |
+| `auto_compression_threshold_tokens` | 自动压缩触发线 | 900K 工作预算推荐 `820000`，保留约 80K 安全余量 |
+| `auto_compression_target_tokens` | 历史摘要规划大小 | 推荐 `12000`；不会作为模型输出 token 上限下发 |
 | `cache_ttl_seconds` | 识别文本缓存时长 | 默认 72 小时 |
 | `cache_max_entries` | 缓存最大条数 | 超出后按 LRU 淘汰 |
 | `max_image_data_bytes` | data URL 解码后单图上限 | 默认 12 MiB |
