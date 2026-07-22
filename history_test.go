@@ -149,6 +149,62 @@ func TestTextContextPrecheckEventIsRecordedBelowCompressionThreshold(t *testing.
 	assertEventStage(t, cfg.events, event.ID, "文本上下文预检")
 }
 
+func TestToolTrajectoriesRemainByteIdenticalBelowCompressionThreshold(t *testing.T) {
+	largeResult := strings.Repeat("tool-result-", 800)
+	responsesInput := []any{map[string]any{"type": "message", "role": "user", "content": []any{map[string]any{"type": "input_text", "text": "finish the task"}}}}
+	chatMessages := []any{map[string]any{"role": "user", "content": "finish the task"}}
+	claudeMessages := []any{map[string]any{"role": "user", "content": []any{map[string]any{"type": "text", "text": "finish the task"}}}}
+	for index := 0; index < 6; index++ {
+		callID := fmt.Sprintf("call_%d", index)
+		output := fmt.Sprintf("%s%d", largeResult, index)
+		responsesInput = append(responsesInput,
+			map[string]any{"type": "reasoning", "id": "reasoning_" + callID, "summary": []any{map[string]any{"type": "summary_text", "text": "continue"}}},
+			map[string]any{"type": "function_call", "id": "fc_" + callID, "call_id": callID, "name": "shell_command", "arguments": `{"command":"inspect"}`},
+			map[string]any{"type": "function_call_output", "call_id": callID, "output": output},
+		)
+		chatMessages = append(chatMessages,
+			map[string]any{"role": "assistant", "content": "continue", "tool_calls": []any{map[string]any{"id": callID, "type": "function", "function": map[string]any{"name": "shell_command", "arguments": `{"command":"inspect"}`}}}},
+			map[string]any{"role": "tool", "tool_call_id": callID, "content": output},
+		)
+		claudeMessages = append(claudeMessages,
+			map[string]any{"role": "assistant", "content": []any{map[string]any{"type": "text", "text": "continue"}, map[string]any{"type": "tool_use", "id": callID, "name": "shell_command", "input": map[string]any{"command": "inspect"}}}},
+			map[string]any{"role": "user", "content": []any{map[string]any{"type": "tool_result", "tool_use_id": callID, "content": output}}},
+		)
+	}
+
+	encode := func(value map[string]any) []byte {
+		raw, err := json.Marshal(value)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return raw
+	}
+	tests := []struct {
+		name     string
+		protocol string
+		raw      []byte
+	}{
+		{name: "OpenAI Chat", protocol: "openai", raw: encode(map[string]any{"model": "combo", "messages": chatMessages})},
+		{name: "OpenAI Responses", protocol: "openai-response", raw: encode(map[string]any{"model": "combo", "input": responsesInput})},
+		{name: "Anthropic Messages", protocol: "claude", raw: encode(map[string]any{"model": "combo", "messages": claudeMessages})},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			cfg := testRuntime()
+			t.Cleanup(cfg.cache.close)
+			cfg.AutoCompressionThresholdTokens = 1_000_000
+			cfg.PrimaryContextBudgetTokens = 1_000_000
+			got, err := prepareTextHostBody(test.raw, test.protocol, cfg, "", cfg.events.begin("combo", "glm", true))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(got) != string(test.raw) {
+				t.Fatalf("tool history changed below compression threshold: before=%d after=%d", len(test.raw), len(got))
+			}
+		})
+	}
+}
+
 func TestFinalTextBodyRemovesOnlyTopLevelOutputLimits(t *testing.T) {
 	cfg := testRuntime()
 	defer cfg.cache.close()
