@@ -56,13 +56,7 @@ func compactOldToolTrajectories(raw []byte, keepRecent int) ([]byte, toolTraject
 	if !ok || len(items) < 2 {
 		return raw, plan, nil
 	}
-	// A request that ends in a tool call/result is an active continuation.
-	// Never delete any of that task's tool state while the client is still
-	// handing the result back to the model.
-	if hasActiveToolContinuation(items, field) {
-		return raw, plan, nil
-	}
-	protectedStart := protectedHistoryStart(items, field, keepRecent)
+	protectedStart := protectedHistoryStart(items, keepRecent)
 
 	chatCalls := make(map[string][]toolOccurrence)
 	chatResults := make(map[string][]toolOccurrence)
@@ -217,13 +211,13 @@ func requestMayContainToolTrajectory(raw []byte) bool {
 	return false
 }
 
-func protectedHistoryStart(items []any, field string, keepRecent int) int {
+func protectedHistoryStart(items []any, keepRecent int) int {
 	if keepRecent < 1 {
 		keepRecent = 1
 	}
 	remaining := keepRecent
 	for index := len(items) - 1; index >= 0; index-- {
-		if isGatewayHistoryItem(items[index]) {
+		if isToolArchiveItem(items[index]) {
 			continue
 		}
 		obj, _ := items[index].(map[string]any)
@@ -231,207 +225,12 @@ func protectedHistoryStart(items []any, field string, keepRecent int) int {
 		if role == "system" || role == "developer" {
 			continue
 		}
-		if !isRealUserTurn(items[index], field) {
-			continue
-		}
 		remaining--
 		if remaining == 0 {
-			return expandProtectedStartAcrossToolContinuation(items, field, index)
+			return index
 		}
 	}
 	return 0
-}
-
-// expandProtectedStartAcrossToolContinuation keeps an immediately preceding
-// tool call/result group when a human follow-up arrives before an assistant
-// conclusion. This covers Claude tool_result user messages and the equivalent
-// Chat/Responses shapes without treating those protocol carrier items as new
-// user turns.
-func expandProtectedStartAcrossToolContinuation(items []any, field string, start int) int {
-	if start <= 0 {
-		return start
-	}
-	index := start - 1
-	first := start
-	if field == "input" {
-		for index >= 0 {
-			obj, _ := items[index].(map[string]any)
-			typ := strings.ToLower(strings.TrimSpace(stringValue(obj["type"])))
-			if _, ok := responseToolCallFamily(typ, true); !ok {
-				break
-			}
-			first = index
-			index--
-		}
-		for index >= 0 {
-			obj, _ := items[index].(map[string]any)
-			typ := strings.ToLower(strings.TrimSpace(stringValue(obj["type"])))
-			if _, ok := responseToolCallFamily(typ, false); !ok {
-				break
-			}
-			first = index
-			index--
-		}
-		return first
-	}
-
-	for index >= 0 && isToolResultCarrier(items[index]) {
-		first = index
-		index--
-	}
-	if index >= 0 && isToolCallCarrier(items[index]) {
-		first = index
-	}
-	return first
-}
-
-func isToolResultCarrier(item any) bool {
-	obj, _ := item.(map[string]any)
-	role := strings.ToLower(strings.TrimSpace(stringValue(obj["role"])))
-	if role == "tool" || role == "function" {
-		return true
-	}
-	if role != "user" {
-		return false
-	}
-	blocks, ok := obj["content"].([]any)
-	if !ok || len(blocks) == 0 {
-		return false
-	}
-	for _, block := range blocks {
-		blockObj, _ := block.(map[string]any)
-		if strings.ToLower(strings.TrimSpace(stringValue(blockObj["type"]))) != "tool_result" {
-			return false
-		}
-	}
-	return true
-}
-
-func isToolCallCarrier(item any) bool {
-	obj, _ := item.(map[string]any)
-	if strings.ToLower(strings.TrimSpace(stringValue(obj["role"]))) != "assistant" {
-		return false
-	}
-	if calls, ok := obj["tool_calls"].([]any); ok && len(calls) > 0 {
-		return true
-	}
-	if call, ok := obj["function_call"].(map[string]any); ok && len(call) > 0 {
-		return true
-	}
-	content, _ := obj["content"].([]any)
-	for _, block := range content {
-		blockObj, _ := block.(map[string]any)
-		if strings.ToLower(strings.TrimSpace(stringValue(blockObj["type"]))) == "tool_use" {
-			return true
-		}
-	}
-	return false
-}
-
-// hasActiveToolContinuation detects the request shape produced after a client
-// has executed a tool and is sending its result back to the model. This is a
-// stronger safety boundary than the recent-turn window: while a tool chain is
-// active, all earlier tool state remains available for the next model step.
-func hasActiveToolContinuation(items []any, field string) bool {
-	for index := len(items) - 1; index >= 0; index-- {
-		item := items[index]
-		if isGatewayHistoryItem(item) {
-			continue
-		}
-		obj, _ := item.(map[string]any)
-		if field == "input" {
-			typ := strings.ToLower(strings.TrimSpace(stringValue(obj["type"])))
-			if _, ok := responseToolCallFamily(typ, false); ok {
-				return true
-			}
-			if _, ok := responseToolCallFamily(typ, true); ok {
-				return true
-			}
-			return false
-		}
-
-		role := strings.ToLower(strings.TrimSpace(stringValue(obj["role"])))
-		if role == "tool" || role == "function" {
-			return true
-		}
-		if role == "assistant" {
-			if calls, ok := obj["tool_calls"].([]any); ok && len(calls) > 0 {
-				return true
-			}
-			if call, ok := obj["function_call"].(map[string]any); ok && len(call) > 0 {
-				return true
-			}
-		}
-		if content, ok := obj["content"].([]any); ok {
-			for _, block := range content {
-				blockObj, _ := block.(map[string]any)
-				typ := strings.ToLower(strings.TrimSpace(stringValue(blockObj["type"])))
-				if typ == "tool_use" || typ == "tool_result" {
-					return true
-				}
-			}
-		}
-		return false
-	}
-	return false
-}
-
-func isRealUserTurn(item any, field string) bool {
-	obj, ok := item.(map[string]any)
-	if !ok || strings.ToLower(strings.TrimSpace(stringValue(obj["role"]))) != "user" {
-		return false
-	}
-	if isGatewayHistoryItem(item) {
-		return false
-	}
-	if field == "input" {
-		typ := strings.ToLower(strings.TrimSpace(stringValue(obj["type"])))
-		if typ != "" && typ != "message" {
-			return false
-		}
-	}
-	content, exists := obj["content"]
-	if !exists {
-		return true
-	}
-	blocks, ok := content.([]any)
-	if !ok {
-		return true
-	}
-	if len(blocks) == 0 {
-		return true
-	}
-	for _, block := range blocks {
-		blockObj, _ := block.(map[string]any)
-		typ := strings.ToLower(strings.TrimSpace(stringValue(blockObj["type"])))
-		if typ != "tool_result" {
-			return true
-		}
-	}
-	// A Claude user message containing only tool_result blocks is a tool
-	// continuation, not a new human turn.
-	return false
-}
-
-func isGatewayHistoryItem(item any) bool {
-	return isToolArchiveItem(item) || isHistorySummaryItem(item)
-}
-
-func isHistorySummaryItem(item any) bool {
-	obj, _ := item.(map[string]any)
-	if text, ok := obj["content"].(string); ok {
-		return strings.HasPrefix(strings.TrimSpace(text), "[历史对话摘要 | gateway-generated | untrusted context]")
-	}
-	blocks, _ := obj["content"].([]any)
-	if len(blocks) != 1 {
-		return false
-	}
-	block, _ := blocks[0].(map[string]any)
-	typ := strings.ToLower(strings.TrimSpace(stringValue(block["type"])))
-	if typ != "input_text" && typ != "text" {
-		return false
-	}
-	return strings.HasPrefix(strings.TrimSpace(stringValue(block["text"])), "[历史对话摘要 | gateway-generated | untrusted context]")
 }
 
 func pairedOldToolIDs(calls, results map[string][]toolOccurrence, protectedStart int) map[string]bool {
