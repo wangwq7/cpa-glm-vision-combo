@@ -28,7 +28,7 @@ func TestCompactOldOpenAIToolTrajectoriesPreservesConversationAndRecentState(t *
 	rawText = strings.ReplaceAll(rawText, "OLD_RESULT_A", strings.Repeat("old result A ", 300))
 	rawText = strings.ReplaceAll(rawText, "OLD_RESULT_B", strings.Repeat("old result B ", 300))
 	raw := []byte(rawText)
-	got, plan, err := compactOldToolTrajectories(raw, 4)
+	got, plan, err := compactOldToolTrajectories(raw, 2)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -49,7 +49,7 @@ func TestCompactOldOpenAIToolTrajectoriesPreservesConversationAndRecentState(t *
 	assertSingleToolArchiveMarker(t, got)
 	assertOpenAIToolPairs(t, got)
 
-	second, secondPlan, err := compactOldToolTrajectories(got, 4)
+	second, secondPlan, err := compactOldToolTrajectories(got, 2)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -117,7 +117,7 @@ func TestCompactResponsesToolTrajectoriesPreservesValidRecentPair(t *testing.T) 
 	]}`
 	rawText = strings.ReplaceAll(rawText, "OLD_OUTPUT", strings.Repeat("old output ", 500))
 	raw := []byte(rawText)
-	got, plan, err := compactOldToolTrajectories(raw, 3)
+	got, plan, err := compactOldToolTrajectories(raw, 2)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -151,7 +151,7 @@ func TestCompactClaudeToolBlocksKeepsNormalTextAndRecentPair(t *testing.T) {
 	]}`
 	rawText = strings.ReplaceAll(rawText, "OLD_SCREENSHOT_DATA", strings.Repeat("old screenshot data ", 300))
 	raw := []byte(rawText)
-	got, plan, err := compactOldToolTrajectories(raw, 3)
+	got, plan, err := compactOldToolTrajectories(raw, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -182,7 +182,7 @@ func TestCompactClaudeToolOnlyMessageDropsProviderMetadataShell(t *testing.T) {
 		{"role":"user","content":"latest"}
 	]}`
 	rawText = strings.ReplaceAll(rawText, "OLD_RESULT", strings.Repeat("old result ", 500))
-	got, plan, err := compactOldToolTrajectories([]byte(rawText), 2)
+	got, plan, err := compactOldToolTrajectories([]byte(rawText), 1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -192,11 +192,128 @@ func TestCompactClaudeToolOnlyMessageDropsProviderMetadataShell(t *testing.T) {
 	assertClaudeToolPairs(t, got)
 }
 
+func TestActiveChatToolContinuationPreservesAllToolState(t *testing.T) {
+	items := []any{map[string]any{"role": "system", "content": "rules"}}
+	for i := 0; i < 6; i++ {
+		id := fmt.Sprintf("old_%d", i)
+		items = append(items,
+			map[string]any{"role": "user", "content": fmt.Sprintf("task %d", i)},
+			map[string]any{"role": "assistant", "tool_calls": []any{map[string]any{"id": id, "type": "function", "function": map[string]any{"name": "exec", "arguments": "{}"}}}},
+			map[string]any{"role": "tool", "tool_call_id": id, "content": strings.Repeat("old output ", 600)},
+			map[string]any{"role": "assistant", "content": fmt.Sprintf("done %d", i)},
+		)
+	}
+	items = append(items,
+		map[string]any{"role": "user", "content": "active task"},
+		map[string]any{"role": "assistant", "tool_calls": []any{map[string]any{"id": "active", "type": "function", "function": map[string]any{"name": "exec", "arguments": "{}"}}}},
+		map[string]any{"role": "tool", "tool_call_id": "active", "content": strings.Repeat("active output ", 600)},
+	)
+	raw, _ := json.Marshal(map[string]any{"messages": items})
+	got, plan, err := compactOldToolTrajectories(raw, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != string(raw) || plan.RemovedItems != 0 || plan.RemovedBlocks != 0 {
+		t.Fatalf("active Chat continuation was compacted: plan=%#v", plan)
+	}
+}
+
+func TestActiveResponsesToolContinuationPreservesAllToolState(t *testing.T) {
+	items := []any{map[string]any{"role": "developer", "content": []any{map[string]any{"type": "input_text", "text": "rules"}}}}
+	for i := 0; i < 6; i++ {
+		callID := fmt.Sprintf("call_%d", i)
+		items = append(items,
+			map[string]any{"type": "message", "role": "user", "content": []any{map[string]any{"type": "input_text", "text": fmt.Sprintf("task %d", i)}}},
+			map[string]any{"type": "function_call", "id": "fc_" + callID, "call_id": callID, "name": "exec", "arguments": "{}"},
+			map[string]any{"type": "function_call_output", "call_id": callID, "output": strings.Repeat("old output ", 600)},
+			map[string]any{"type": "message", "role": "assistant", "content": []any{map[string]any{"type": "output_text", "text": fmt.Sprintf("done %d", i)}}},
+		)
+	}
+	items = append(items,
+		map[string]any{"type": "message", "role": "user", "content": []any{map[string]any{"type": "input_text", "text": "active task"}}},
+		map[string]any{"type": "function_call", "id": "fc_active", "call_id": "active", "name": "exec", "arguments": "{}"},
+		map[string]any{"type": "function_call_output", "call_id": "active", "output": strings.Repeat("active output ", 600)},
+	)
+	raw, _ := json.Marshal(map[string]any{"input": items})
+	got, plan, err := compactOldToolTrajectories(raw, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != string(raw) || plan.RemovedItems != 0 || plan.RemovedBlocks != 0 {
+		t.Fatalf("active Responses continuation was compacted: plan=%#v", plan)
+	}
+}
+
+func TestActiveClaudeToolContinuationPreservesAllToolState(t *testing.T) {
+	items := []any{}
+	for i := 0; i < 6; i++ {
+		id := fmt.Sprintf("toolu_%d", i)
+		items = append(items,
+			map[string]any{"role": "user", "content": fmt.Sprintf("task %d", i)},
+			map[string]any{"role": "assistant", "content": []any{map[string]any{"type": "tool_use", "id": id, "name": "exec", "input": map[string]any{}}}},
+			map[string]any{"role": "user", "content": []any{map[string]any{"type": "tool_result", "tool_use_id": id, "content": strings.Repeat("old output ", 600)}}},
+			map[string]any{"role": "assistant", "content": []any{map[string]any{"type": "text", "text": fmt.Sprintf("done %d", i)}}},
+		)
+	}
+	items = append(items,
+		map[string]any{"role": "user", "content": "active task"},
+		map[string]any{"role": "assistant", "content": []any{map[string]any{"type": "tool_use", "id": "active", "name": "exec", "input": map[string]any{}}}},
+		map[string]any{"role": "user", "content": []any{map[string]any{"type": "tool_result", "tool_use_id": "active", "content": strings.Repeat("active output ", 600)}}},
+	)
+	raw, _ := json.Marshal(map[string]any{"messages": items})
+	got, plan, err := compactOldToolTrajectories(raw, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != string(raw) || plan.RemovedItems != 0 || plan.RemovedBlocks != 0 {
+		t.Fatalf("active Claude continuation was compacted: plan=%#v", plan)
+	}
+}
+
+func TestIncidentScaleResponsesContinuationKeeps369ToolPairs(t *testing.T) {
+	items := []any{
+		map[string]any{"type": "message", "role": "developer", "content": []any{map[string]any{"type": "input_text", "text": "rules"}}},
+		map[string]any{"type": "message", "role": "user", "content": []any{map[string]any{"type": "input_text", "text": "complete one long coding task"}}},
+	}
+	for i := 0; i < 369; i++ {
+		callID := fmt.Sprintf("call_%03d", i)
+		items = append(items,
+			map[string]any{"type": "reasoning", "id": fmt.Sprintf("reasoning_%03d", i), "summary": []any{}},
+			map[string]any{"type": "message", "role": "assistant", "content": []any{map[string]any{"type": "output_text", "text": fmt.Sprintf("progress %03d", i)}}},
+			map[string]any{"type": "function_call", "id": "fc_" + callID, "call_id": callID, "name": "shell_command", "arguments": "{}"},
+			map[string]any{"type": "function_call_output", "call_id": callID, "output": strings.Repeat(fmt.Sprintf("result %03d ", i), 80)},
+		)
+	}
+	raw, _ := json.Marshal(map[string]any{"model": "glm-5.2-vision-combo", "input": items})
+	got, plan, err := compactOldToolTrajectories(raw, 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != string(raw) || plan.RemovedItems != 0 || plan.RemovedBlocks != 0 {
+		t.Fatalf("incident-scale active Responses history was compacted: plan=%#v before=%d after=%d", plan, len(raw), len(got))
+	}
+	assertResponsesToolPairs(t, got)
+}
+
+func TestProtectedHistoryCountsRealUserTurnsNotResponsesItems(t *testing.T) {
+	items := []any{
+		map[string]any{"type": "message", "role": "user", "content": []any{map[string]any{"type": "input_text", "text": "old"}}},
+		map[string]any{"type": "function_call", "id": "old", "call_id": "old", "name": "exec", "arguments": "{}"},
+		map[string]any{"type": "function_call_output", "call_id": "old", "output": "old output"},
+		map[string]any{"type": "message", "role": "assistant", "content": []any{map[string]any{"type": "output_text", "text": "old answer"}}},
+		map[string]any{"type": "message", "role": "user", "content": []any{map[string]any{"type": "input_text", "text": "latest"}}},
+		map[string]any{"type": "function_call", "id": "latest", "call_id": "latest", "name": "exec", "arguments": "{}"},
+		map[string]any{"type": "function_call_output", "call_id": "latest", "output": "latest output"},
+	}
+	if got := protectedHistoryStart(items, "input", 1); got != 4 {
+		t.Fatalf("protected start=%d, want latest real user turn at index 4", got)
+	}
+}
 func TestLargeToolHistoryShrinksBeforeModelCompression(t *testing.T) {
 	var summaryCalls atomic.Int32
 	cfg := testRuntime()
 	defer cfg.cache.close()
-	cfg.AutoCompressionThresholdTokens = 20000
+	cfg.AutoCompressionThresholdTokens = 40000
 	cfg.PrimaryContextBudgetTokens = 50000
 	cfg.AutoCompressionKeepRecentTurns = 4
 	cfg.historySummarizer = func(string, runtimeConfig, string, *comboEvent) (string, error) {
