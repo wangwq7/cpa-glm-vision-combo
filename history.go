@@ -22,7 +22,7 @@ func prepareFinalTextBody(raw []byte, cfg runtimeConfig, callbackID string, even
 		return nil, err
 	}
 	if toolPlan.RemovedItems > 0 || toolPlan.RemovedBlocks > 0 {
-		detail := fmt.Sprintf("已归档较早且完整配对的工具轨迹：移除 %d 条完整消息/项目及 %d 个嵌套工具块；请求由约 %d token 降至 %d token，减少 %d 字节。用户文本、普通回答和最近 %d 条对话项目保持原文。", toolPlan.RemovedItems, toolPlan.RemovedBlocks, estimateBodyTokens(raw), estimateBodyTokens(compacted), toolPlan.savedBytes(), cfg.AutoCompressionKeepRecentTurns)
+		detail := fmt.Sprintf("已归档较早且完整配对的工具轨迹：移除 %d 条完整消息/项目及 %d 个嵌套工具块；请求由约 %d token 降至 %d token，减少 %d 字节。系统/开发者规则、用户文本、普通回答，以及最近 %d 个真实用户轮次保持原文；活动工具续轮不会进入此归档。", toolPlan.RemovedItems, toolPlan.RemovedBlocks, estimateBodyTokens(raw), estimateBodyTokens(compacted), toolPlan.savedBytes(), cfg.AutoCompressionKeepRecentTurns)
 		cfg.events.stage(event, "旧工具轨迹归档", "完成", "本地确定性处理", detail, compactionStarted)
 	}
 	raw = compacted
@@ -52,12 +52,15 @@ func prepareFinalTextBody(raw []byte, cfg runtimeConfig, callbackID string, even
 		return nil, fmt.Errorf("cannot compress invalid request JSON: %w", err)
 	}
 	field, items, ok := conversationField(root)
-	if !ok || len(items) < 2 {
-		return nil, fmt.Errorf("conversation exceeds its working budget but has no compressible OpenAI history")
+	if !ok {
+		return keepUncompressedHistoryOrBudgetError(raw, initialTokens, cfg, false)
+	}
+	if len(items) < 2 {
+		return keepUncompressedHistoryOrBudgetError(raw, initialTokens, cfg, hasActiveToolContinuation(items, field))
 	}
 	persistent, compressible := splitPersistentHistory(items)
 	if len(compressible) < 2 {
-		return nil, fmt.Errorf("conversation has no earlier turns available for compression")
+		return keepUncompressedHistoryOrBudgetError(raw, initialTokens, cfg, hasActiveToolContinuation(compressible, field))
 	}
 
 	checkpointKeys, err := historyCheckpointKeys(field, compressible, cfg)
@@ -66,20 +69,30 @@ func prepareFinalTextBody(raw []byte, cfg runtimeConfig, callbackID string, even
 	}
 	checkpointSummary, checkpointIndex, checkpointFound := cfg.cache.getLast(checkpointKeys)
 	checkpointPrefix := checkpointIndex + 1
+	latestTurnStart := protectedHistoryStart(compressible, field, 1)
+	if checkpointFound && checkpointPrefix > latestTurnStart {
+		// A cached summary must never cross into the latest real user turn.
+		// The cache key also includes keepRecent, but retain this guard for
+		// configuration and data migrations.
+		checkpointFound = false
+		checkpointSummary = ""
+		checkpointPrefix = 0
+	}
 	if checkpointFound {
 		rebuilt, err := compressedHistoryBody(root, field, persistent, checkpointSummary, compressible[checkpointPrefix:])
 		if err != nil {
 			return nil, err
 		}
 		if estimateBodyTokens(rebuilt) <= cfg.PrimaryContextBudgetTokens {
-			cfg.events.stage(event, "复用历史压缩检查点", "完成", "缓存", fmt.Sprintf("复用 %d 条历史消息的持久摘要，仅保留其后的 %d 条新增/近期消息；未调用压缩模型。", checkpointPrefix, len(compressible)-checkpointPrefix), time.Now())
+			recentTurns := countRealUserTurns(compressible[checkpointPrefix:], field)
+			cfg.events.stage(event, "复用历史压缩检查点", "完成", "缓存", fmt.Sprintf("复用 %d 条历史项目的持久摘要，仅保留其后的 %d 条新增/近期项目（%d 个真实用户轮次）；未调用压缩模型。", checkpointPrefix, len(compressible)-checkpointPrefix, recentTurns), time.Now())
 			return rebuilt, nil
 		}
 	}
 
 	prefixCount, ok := chooseHistoryCheckpointPrefix(root, field, persistent, compressible, checkpointPrefix, cfg)
 	if !ok {
-		return nil, fmt.Errorf("conversation still exceeds the primary working budget (%d tokens); even one recent message cannot fit beside the configured summary reserve", cfg.PrimaryContextBudgetTokens)
+		return keepUncompressedHistoryOrBudgetError(raw, initialTokens, cfg, hasActiveToolContinuation(compressible, field))
 	}
 	sourceItems := compressible[:prefixCount]
 	stageName := "创建历史压缩检查点"
@@ -106,7 +119,7 @@ func prepareFinalTextBody(raw []byte, cfg runtimeConfig, callbackID string, even
 	if estimateBodyTokens(encoded) > cfg.PrimaryContextBudgetTokens {
 		return nil, fmt.Errorf("conversation still exceeds the primary working budget (%d tokens) after one checkpoint update", cfg.PrimaryContextBudgetTokens)
 	}
-	detail := fmt.Sprintf("历史前缀 %d 条已生成可复用摘要；保留最近 %d 条原文。后续追加少量对话将直接复用，不再逐轮重新压缩。", prefixCount, len(recent))
+	detail := fmt.Sprintf("历史前缀 %d 条项目已生成可复用摘要；保留最近 %d 条原文项目（%d 个真实用户轮次），活动工具链保持原文。后续追加少量对话将直接复用，不再逐轮重新压缩。", prefixCount, len(recent), countRealUserTurns(recent, field))
 	cfg.events.stage(event, stageName, "完成", compressionModelName(cfg), detail, started)
 	return encoded, nil
 }
@@ -170,23 +183,51 @@ func splitPersistentHistory(items []any) ([]any, []any) {
 }
 
 func chooseHistoryCheckpointPrefix(root map[string]any, field string, persistent, compressible []any, minimumPrefix int, cfg runtimeConfig) (int, bool) {
-	maxKeep := minInt(cfg.AutoCompressionKeepRecentTurns, len(compressible)-1)
+	maxKeep := minInt(cfg.AutoCompressionKeepRecentTurns, countRealUserTurns(compressible, field))
+	if maxKeep < 1 {
+		return 0, false
+	}
 	reserveChars := cfg.AutoCompressionTargetTokens * 4
 	if reserveChars < 256 {
 		reserveChars = 256
 	}
 	reservedSummary := strings.Repeat("x", reserveChars)
+	lastPrefix := -1
 	for keep := maxKeep; keep >= 1; keep-- {
-		prefixCount := len(compressible) - keep
-		if prefixCount <= minimumPrefix {
+		// Select only true user-turn boundaries. For Responses, reasoning and
+		// function-call items are part of the surrounding turn; for Claude, a
+		// user carrier containing only tool_result blocks is not a new turn.
+		prefixCount := protectedHistoryStart(compressible, field, keep)
+		if prefixCount <= minimumPrefix || prefixCount == lastPrefix {
 			continue
 		}
+		lastPrefix = prefixCount
 		candidate, err := compressedHistoryBody(root, field, persistent, reservedSummary, compressible[prefixCount:])
 		if err == nil && estimateBodyTokens(candidate) <= cfg.PrimaryContextBudgetTokens {
 			return prefixCount, true
 		}
 	}
 	return 0, false
+}
+
+func countRealUserTurns(items []any, field string) int {
+	count := 0
+	for _, item := range items {
+		if isRealUserTurn(item, field) {
+			count++
+		}
+	}
+	return count
+}
+
+func keepUncompressedHistoryOrBudgetError(raw []byte, initialTokens int, cfg runtimeConfig, activeToolContinuation bool) ([]byte, error) {
+	if initialTokens <= cfg.PrimaryContextBudgetTokens {
+		return raw, nil
+	}
+	if activeToolContinuation {
+		return nil, fmt.Errorf("active tool continuation exceeds the primary working budget (%d tokens); refusing to summarize or discard the current tool state", cfg.PrimaryContextBudgetTokens)
+	}
+	return nil, fmt.Errorf("conversation exceeds the primary working budget (%d tokens) and has no safe earlier user-turn boundary available for compression", cfg.PrimaryContextBudgetTokens)
 }
 
 func compressedHistoryBody(root map[string]any, field string, persistent []any, summary string, recent []any) ([]byte, error) {
@@ -206,7 +247,7 @@ func compressedHistoryBody(root map[string]any, field string, persistent []any, 
 func historyCheckpointKeys(field string, items []any, cfg runtimeConfig) ([]string, error) {
 	models := uniqueModels(append([]string{compressionModelName(cfg)}, cfg.TextFallbackModels...))
 	digest := sha256.New()
-	digest.Write([]byte("history-checkpoint-v2\x00" + field + "\x00" + strings.Join(models, "\x00") + "\x00" + fmt.Sprint(cfg.AutoCompressionTargetTokens) + "\x00"))
+	digest.Write([]byte("history-checkpoint-v3\x00" + field + "\x00" + strings.Join(models, "\x00") + "\x00" + fmt.Sprint(cfg.AutoCompressionTargetTokens) + "\x00" + fmt.Sprint(cfg.AutoCompressionKeepRecentTurns) + "\x00"))
 	keys := make([]string, 0, len(items))
 	var length [8]byte
 	for _, item := range items {
